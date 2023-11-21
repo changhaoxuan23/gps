@@ -1,6 +1,7 @@
 // gps - list all compute processes running on gpu with detailed information
 // Copyright (C) 2023 Haoxuan Chang<changhaoxuan23@mails.ucas.ac.cn>
 
+// This is part of gps.
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU Affero General Public License as
 // published by the Free Software Foundation, either version 3 of the
@@ -13,6 +14,7 @@
 
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
+#include "nvml_common.hh"
 #include <array>
 #include <cassert>
 #include <cerrno>
@@ -24,7 +26,6 @@
 #include <dirent.h>
 #include <fcntl.h>
 #include <map>
-#include <nvml.h>
 #include <pwd.h>
 #include <regex>
 #include <string>
@@ -39,38 +40,6 @@
       exit(EXIT_FAILURE);                                                                                    \
     }                                                                                                        \
   } while (false)
-struct device_information {
-  unsigned int id;     // index of the device
-  std::string name;    // name of the device
-  nvmlMemory_t memory; // memory statistics
-
-  // construct by directly query with the NVML library
-  device_information(nvmlDevice_t device) {
-    std::array<char, NVML_DEVICE_NAME_V2_BUFFER_SIZE> buffer;
-    nvmlReturn_t return_value;
-    return_value = nvmlDeviceGetIndex(device, std::addressof(this->id));
-    if (return_value != NVML_SUCCESS) {
-      fprintf(stderr, "failed to get device id: %s\n", nvmlErrorString(return_value));
-      this->id = -1;
-    }
-    return_value = nvmlDeviceGetName(device, buffer.data(), buffer.size());
-    if (return_value != NVML_SUCCESS) {
-      fprintf(stderr, "failed to get device name for %u: %s\n", this->id, nvmlErrorString(return_value));
-      buffer.at(0) = '\0';
-    }
-    this->name = buffer.data();
-    return_value = nvmlDeviceGetMemoryInfo(device, std::addressof(this->memory));
-    if (return_value != NVML_SUCCESS) {
-      fprintf(
-          stderr, "failed to get device memory statistics for %u: %s\n", this->id,
-          nvmlErrorString(return_value)
-      );
-      this->memory.free = NVML_VALUE_NOT_AVAILABLE;
-      this->memory.used = NVML_VALUE_NOT_AVAILABLE;
-      this->memory.total = NVML_VALUE_NOT_AVAILABLE;
-    }
-  }
-};
 struct process_information {
 private:
   static auto get_pagesize() -> unsigned int {
@@ -263,54 +232,12 @@ public:
     }
   }
 };
-inline auto get_readable_size(unsigned long long value) -> std::string {
-  std::array<std::string, 6> suffixes = {"B", "KiB", "MiB", "GiB", "TiB", "PiB"};
-  long double temporary = value;
-  unsigned int selection = 0;
-  while (selection < suffixes.size() - 1) {
-    if (temporary / 1024 > 1000) {
-      temporary /= 1024;
-      selection += 1;
-    } else {
-      break;
-    }
-  }
-  value = static_cast<unsigned long long>(round(temporary));
-  return std::to_string(value) + suffixes[selection];
-}
-inline auto get_readable_duration(unsigned long long seconds) -> std::string {
-  const static std::array<std::string, 4> suffixes = {"day(s)", "hour(s)", "minute(s)", "second(s)"};
-  const static std::array<unsigned int, 4> ratios = {0, 24, 60, 60};
-  std::array<unsigned long long, 4> values;
-  values.back() = seconds;
-  for (size_t i = values.size() - 1; i != 0; i--) {
-    values.at(i - 1) = values.at(i) / ratios.at(i);
-    values.at(i) %= ratios.at(i);
-  }
-  bool start = false;
-  std::string result;
-  for (size_t i = 0; i < values.size(); i++) {
-    if (values.at(i) != 0) {
-      start = true;
-    }
-    if (start) {
-      result += std::to_string(values.at(i)) + " " + suffixes.at(i);
-      if (i != values.size() - 1) {
-        result += ", ";
-      }
-    }
-  }
-  if (!start) {
-    result = "0 second";
-  }
-  return result;
-}
 auto main() -> int {
   fprintf(stdout, "gps v0.0.1 licensed under AGPLv3 or later\n");
   fprintf(stdout, "you can goto https://github.com/changhaoxuan23/gps for source code\n\n");
   panic_on_failure(nvmlInit_v2);
   unsigned int device_count = 0;
-  panic_on_failure(nvmlDeviceGetCount_v2, &device_count);
+  panic_on_failure(nvmlDeviceGetCount, &device_count);
   std::map<unsigned int, process_information> processes;
   std::vector<device_information> devices;
   devices.reserve(device_count);

@@ -1,0 +1,551 @@
+// glaunch - Launch computational process on proper GPUs regards to memory availability
+// Copyright (C) 2023 Haoxuan Chang<changhaoxuan23@mails.ucas.ac.cn>
+
+// This is part of gps.
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as
+// published by the Free Software Foundation, either version 3 of the
+// License, or (at your option) any later version.
+
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU Affero General Public License for more details.
+
+// You should have received a copy of the GNU Affero General Public License
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+#include "nvml_common.hh"
+#include <algorithm>
+#include <cassert>
+#include <cctype>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <ctime>
+#include <functional>
+#include <string>
+#include <string_view>
+#include <sys/wait.h>
+#include <thread>
+#include <unistd.h>
+#include <unordered_map>
+#include <utility>
+#include <vector>
+#define EXEC_NAME "glaunch"
+#define GLAUNCH_VERSION "v0.0.1"
+struct Configurations {
+private:
+  using parser_argument_iterator_t = std::vector<std::string>::const_iterator;
+  using parser_t = std::function<void(parser_argument_iterator_t, parser_argument_iterator_t)>;
+  struct Option {
+    const parser_t parser;
+    std::string name;
+    size_t argument_count;
+
+    Option(parser_t parser, std::string name, size_t argument_count)
+        : parser(std::move(parser)), name(std::move(name)), argument_count(argument_count) {}
+  };
+  template <typename T> static auto full_convert_ull(const std::string &value) -> T {
+    size_t pos = 0;
+    unsigned long long result;
+    try {
+      result = std::stoi(value, std::addressof(pos));
+    } catch (const std::exception &error) {
+      pos = 0;
+    }
+    if (value.size() == 0 || pos == 0) {
+      fprintf(stderr, "cannot convert %s.\n", value.c_str());
+      exit(EXIT_FAILURE);
+    }
+    return static_cast<T>(result);
+  }
+  static void true_saver(bool &target, parser_argument_iterator_t begin, parser_argument_iterator_t end) {
+    assert(begin == end);
+    target = true;
+  }
+  static void
+  parser_dispatcher(const Option &option, size_t &break_point, const std::vector<std::string> &args) {
+    if (args[break_point] == option.name) {
+      if (args.size() <= break_point + option.argument_count) {
+        fprintf(stderr, "%s expects arguments but not provided\n", option.name.c_str());
+        exit(EXIT_FAILURE);
+      }
+      auto step = static_cast<parser_argument_iterator_t::difference_type>(++break_point);
+      option.parser(
+          std::next(args.cbegin(), step),
+          std::next(args.cbegin(), step + static_cast<decltype(step)>(option.argument_count))
+      );
+      break_point += option.argument_count;
+    } else if (option.argument_count == 1 && args[break_point].substr(0, option.name.size() + 1) == (option.name + '=')) {
+      std::vector<std::string> temporary;
+      temporary.emplace_back(args[break_point++].substr(option.name.size() + 1));
+      option.parser(temporary.cbegin(), temporary.cend());
+    } else {
+      fprintf(
+          stderr, "invalid option string %s with option name %s\n", args[break_point].c_str(),
+          option.name.c_str()
+      );
+      exit(EXIT_FAILURE);
+    }
+  }
+  static auto test_option(const Option &option, size_t &break_point, const std::vector<std::string> &args)
+      -> bool {
+    if (args[break_point].substr(0, option.name.size()) == option.name) {
+      parser_dispatcher(option, break_point, args);
+      return true;
+    }
+    return false;
+  }
+  static auto get_size_suffix_map() -> const std::unordered_map<std::string, unsigned long long> & {
+    static bool initialize = true;
+    static std::unordered_map<std::string, unsigned long long> map;
+    if (initialize) {
+      map.insert({"kib", 1024ull});
+      map.insert({"kb", 1024ull});
+      map.insert({"k", 1024ull});
+
+      map.insert({"mib", 1024ull * 1024});
+      map.insert({"mb", 1024ull * 1024});
+      map.insert({"m", 1024ull * 1024});
+
+      map.insert({"gib", 1024ull * 1024 * 1024});
+      map.insert({"gb", 1024ull * 1024 * 1024});
+      map.insert({"g", 1024ull * 1024 * 1024});
+
+      map.insert({"tib", 1024ull * 1024 * 1024 * 1024});
+      map.insert({"tb", 1024ull * 1024 * 1024 * 1024});
+      map.insert({"t", 1024ull * 1024 * 1024 * 1024});
+
+      map.insert({"pib", 1024ull * 1024 * 1024 * 1024 * 1024});
+      map.insert({"pb", 1024ull * 1024 * 1024 * 1024 * 1024});
+      map.insert({"p", 1024ull * 1024 * 1024 * 1024 * 1024});
+    }
+    return map;
+  }
+  static auto get_duration_suffix_map() -> const std::unordered_map<std::string, unsigned long long> & {
+    static bool initialize = true;
+    static std::unordered_map<std::string, unsigned long long> map;
+    if (initialize) {
+      map.insert({"m", 60ull});
+      map.insert({"minute", 60ull});
+      map.insert({"minutes", 60ull});
+
+      map.insert({"h", 60ull * 60});
+      map.insert({"hour", 60ull * 60});
+      map.insert({"hours", 60ull * 60});
+
+      map.insert({"d", 60ull * 60 * 24});
+      map.insert({"day", 60ull * 60 * 24});
+      map.insert({"days", 60ull * 60 * 24});
+    }
+    return map;
+  }
+  void parse_gpu_count(parser_argument_iterator_t begin, parser_argument_iterator_t end) {
+    assert(std::next(begin) == end);
+    if (this->gpu_count != 1) {
+      fprintf(stderr, "multiple instance of option --gpus, the last one takes effect\n");
+    }
+    this->gpu_count = full_convert_ull<unsigned int>(*begin);
+    if (this->gpu_count > 16) {
+      fprintf(stderr, "%u GPUs? Amazing, you lucky guy!\n", this->gpu_count);
+    }
+  }
+  void parse_memory_estimation(parser_argument_iterator_t begin, parser_argument_iterator_t end) {
+    assert(std::next(begin) == end);
+    if (this->memory_estimation != NoEstimation) {
+      fprintf(
+          stderr, "multiple instance of option --memory-budget, the last "
+                  "one takes effect\n"
+      );
+    }
+    size_t pos = 0;
+    try {
+      this->memory_estimation = std::stoull(*begin, std::addressof(pos));
+    } catch (const std::exception &e) {
+      fprintf(stderr, "invalid value %s\n", begin->c_str());
+      exit(EXIT_FAILURE);
+    }
+    if (pos != begin->size()) {
+      auto suffix = begin->substr(pos);
+      std::for_each(suffix.begin(), suffix.end(), [](auto &c) { c = tolower(c); });
+      const auto &map = get_size_suffix_map();
+      auto iter = map.find(suffix);
+      if (iter == map.cend()) {
+        fprintf(stderr, "invalid suffix %s\n", begin->substr(pos).c_str());
+        exit(EXIT_FAILURE);
+      }
+      this->memory_estimation *= iter->second;
+    }
+    if (this->memory_estimation > 0x2000000000ull) {
+      fprintf(stderr, "%llu bytes! you must be doing something fascinating!\n", this->memory_estimation);
+    }
+  }
+  void parse_policy(parser_argument_iterator_t begin, parser_argument_iterator_t end) {
+    assert(std::next(begin) == end);
+    std::string test(*begin);
+    std::for_each(test.begin(), test.end(), [](auto &c) { c = tolower(c); });
+    if (test.compare("worst") == 0 || test.compare("worstfit") == 0) {
+      this->policy = SelectionPolicy::WorstFit;
+    } else if (test.compare("best") == 0 || test.compare("bestfit") == 0) {
+      this->policy = SelectionPolicy::BestFit;
+    } else {
+      fprintf(stderr, "invalid policy %s\n", begin->c_str());
+      exit(EXIT_FAILURE);
+    }
+  }
+  void parse_logging_path(parser_argument_iterator_t begin, parser_argument_iterator_t end) {
+    assert(std::next(begin) == end);
+    this->logging_path = *begin;
+  }
+  void parse_monitor_gpu_memory(parser_argument_iterator_t begin, parser_argument_iterator_t end) {
+    assert(std::next(begin) == end);
+    size_t pos = 0;
+    try {
+      this->monitor_gpu_memory = std::stoull(*begin, std::addressof(pos));
+    } catch (const std::exception &e) {
+      fprintf(stderr, "invalid value %s\n", begin->c_str());
+      exit(EXIT_FAILURE);
+    }
+    if (pos != begin->size()) {
+      auto suffix = begin->substr(pos);
+      std::for_each(suffix.begin(), suffix.end(), [](auto &c) { c = tolower(c); });
+      const auto &map = get_duration_suffix_map();
+      auto iter = map.find(suffix);
+      if (iter == map.cend()) {
+        fprintf(stderr, "invalid suffix %s\n", begin->substr(pos).c_str());
+        exit(EXIT_FAILURE);
+      }
+      this->monitor_gpu_memory *= iter->second;
+    }
+  }
+  static void help(parser_argument_iterator_t begin, parser_argument_iterator_t end) {
+    assert(begin == end);
+    printf("Launch computational process on proper GPUs regards to "
+           "memory availability\n");
+    printf("Usage: " EXEC_NAME " [OPTIONS...] [--] PROGRAM [ARGS...]\n");
+    printf("OPTIONS:\n");
+    printf("  --gpus GPU_COUNT              Use GPU_COUNT gpus for this program, defaults to 1\n\n");
+    printf("  --memory-budget MEMORY_SIZE   Slight over-estimated size of memory your program will\n");
+    printf("                                 consume per GPU. Suffixes are allowed to simplify this\n");
+    printf("                                 configuration, try KiB, MiB, GiB, etc.. If you do not\n");
+    printf("                                 specify such value, we assume that your program could\n");
+    printf("                                 run with arbitrary amount of memory\n\n");
+    printf("  --policy POLICY               Policy used to select GPU devices. Currently two policies\n");
+    printf("                                 are supported while we defaults to the first one:\n");
+    printf("                                  WorstFit: MAXIMIZE free space after your program launches\n");
+    printf("                                  BestFit: MINIMIZE free space after your program launches\n\n");
+    printf("  --time                        When the program terminates, summary its elapsed time\n\n");
+    printf("  --log PATH                    Duplicate and save stdout and stderr to PATH\n\n");
+    printf("  --watch-memory INTERVAL       Dump GPU memory usage every INTERVAL seconds, suffixes are\n");
+    printf("                                 supported, try m, h, d\n\n");
+    printf("  --help                        Show this message again\n");
+    printf("\n");
+    printf("If you got some trouble on argument parsing, which may be triggered by a program whose name\n");
+    printf(R"( starts with '--', you can add '--' before it to terminate option parsing manually)");
+    printf("\n\n");
+    printf("PROGRAM: the program to launch\n");
+    printf("ARGS: arguments passed to PROGRAM which will not be modified\n");
+    exit(EXIT_SUCCESS);
+  }
+
+public:
+  static constexpr unsigned long long NoEstimation = -1;
+  enum class SelectionPolicy {
+    BestFit,  // minimize difference between the free memory on the GPU and your
+              // budget
+    WorstFit, // maximize difference between the free memory on the GPU and your
+              // budget
+  };
+
+  // index of the first command line component after options
+  size_t break_point;
+
+  // number of GPUs to use
+  unsigned int gpu_count{1};
+
+  // slightly overly estimated memory budget per GPU
+  unsigned long long memory_estimation{NoEstimation};
+
+  // policy when selecting GPU
+  SelectionPolicy policy{SelectionPolicy::WorstFit};
+
+  // if we shall measure (elapsed) time of the program
+  bool timing{false};
+
+  // destination path to duplicate and store output from the program
+  std::string logging_path{};
+
+  // time interval between two samples on GPU memory consumption are taken
+  unsigned long long monitor_gpu_memory{0};
+
+  Configurations(const std::vector<std::string> &args) {
+    this->break_point = 1;
+    std::vector<Option> options;
+    options.emplace_back(
+        [this](parser_argument_iterator_t begin, parser_argument_iterator_t end) {
+          this->parse_gpu_count(begin, end);
+        },
+        "--gpus", 1
+    );
+    options.emplace_back(
+        [this](parser_argument_iterator_t begin, parser_argument_iterator_t end) {
+          this->parse_memory_estimation(begin, end);
+        },
+        "--memory-budget", 1
+    );
+    options.emplace_back(
+        [this](parser_argument_iterator_t begin, parser_argument_iterator_t end) {
+          this->parse_policy(begin, end);
+        },
+        "--policy", 1
+    );
+    options.emplace_back(
+        [](parser_argument_iterator_t begin, parser_argument_iterator_t end) {
+          Configurations::help(begin, end);
+        },
+        "--help", 0
+    );
+    options.emplace_back(
+        [this](parser_argument_iterator_t begin, parser_argument_iterator_t end) {
+          Configurations::true_saver(this->timing, begin, end);
+        },
+        "--time", 0
+    );
+    options.emplace_back(
+        [this](parser_argument_iterator_t begin, parser_argument_iterator_t end) {
+          this->parse_logging_path(begin, end);
+        },
+        "--log", 1
+    );
+    options.emplace_back(
+        [this](parser_argument_iterator_t begin, parser_argument_iterator_t end) {
+          this->parse_monitor_gpu_memory(begin, end);
+        },
+        "--watch-memory", 1
+    );
+
+    while (this->break_point < args.size() && args[this->break_point].substr(0, 2).compare("--") == 0) {
+      if (args[this->break_point].size() == 2) {
+        // it is just '--'
+        ++this->break_point;
+        break;
+      }
+      bool matched = false;
+      for (const auto &option : options) {
+        if (test_option(option, this->break_point, args)) {
+          matched = true;
+          break;
+        }
+      }
+      if (!matched) {
+        fprintf(stderr, "unrecognized option %s\n", args[this->break_point].c_str());
+        exit(EXIT_FAILURE);
+      }
+    }
+  }
+
+  void dump(FILE *target) const {
+    fprintf(target, "========== configuration dump ==========\n");
+    fprintf(target, "  gpu_count: %u\n", this->gpu_count);
+    fprintf(target, "  memory_estimation: %llu\n", this->memory_estimation);
+    fprintf(target, "  policy: %s\n", this->policy == SelectionPolicy::BestFit ? "BestFit" : "WorstFit");
+    fprintf(target, "  timing: %s\n", this->timing ? "true" : "false");
+    fprintf(target, "  logging_path: %s\n", this->logging_path.c_str());
+    fprintf(target, "  monitor_gpu_memory: %llu\n", this->monitor_gpu_memory);
+    fprintf(target, "========== configuration dump ==========\n");
+  }
+
+  [[nodiscard]] auto direct_exec() const -> bool { return !this->timing && this->monitor_gpu_memory == 0; }
+};
+static auto do_launch(char *argv[], const Configurations &config) -> int {
+  // set process group id to group processes forked from the actual computing process
+  setpgid(0, 0);
+  execvp(argv[config.break_point], std::addressof(argv[config.break_point]));
+  perror("failed to exec");
+  return -ENOEXEC;
+}
+static void gpu_memory_watcher(
+    const pid_t pid, const std::vector<unsigned int> &device_ids, const Configurations &config
+) {
+  while (true) {
+    std::this_thread::sleep_for(std::chrono::seconds(config.monitor_gpu_memory));
+    unsigned long long total_memory = 0;
+    for (const auto id : device_ids) {
+      nvmlDevice_t device = nullptr;
+      nvmlReturn_t return_value = nvmlDeviceGetHandleByIndex(id, &device);
+      if (return_value != NVML_SUCCESS) {
+        fprintf(stderr, "failed to open device %u: %s, skipping.\n", id, nvmlErrorString(return_value));
+        continue;
+      }
+      auto [status, processes] = get_processes_on_device(device);
+      if (status != NVML_SUCCESS) {
+        fprintf(
+            stderr, "failed to get processes on device %u: %s, skipping.\n", id, nvmlErrorString(return_value)
+        );
+        continue;
+      }
+      for (const auto &process : processes) {
+        if (getpgid(static_cast<pid_t>(process.pid)) == pid) {
+          total_memory += process.usedGpuMemory;
+        }
+      }
+    }
+    time_t current_time = time(nullptr);
+    struct tm *current_tm;
+    current_tm = localtime(&current_time);
+    char buffer[512];
+    strftime(buffer, sizeof(buffer), "[%EY %B %d %T]", current_tm);
+    fprintf(stderr, "%s %s GPU memory in use\n", buffer, get_readable_size(total_memory).c_str());
+  }
+}
+auto main(int argc, char *argv[]) -> int {
+  fprintf(stdout, EXEC_NAME " " GLAUNCH_VERSION " licensed under AGPLv3 or later\n");
+  fprintf(stdout, "you can goto https://github.com/changhaoxuan23/gps for source code\n\n");
+  std::vector<std::string> args;
+  args.reserve(argc);
+  for (int i = 0; i < argc; i++) {
+    args.emplace_back(argv[i]);
+  }
+  Configurations config(args);
+  config.dump(stdout);
+
+  panic_on_failure(nvmlInit_v2);
+  unsigned int device_count = 0;
+  panic_on_failure(nvmlDeviceGetCount, &device_count);
+  if (device_count < config.gpu_count) {
+    fprintf(
+        stderr,
+        "requesting %u GPUs which is more than the number of GPUs (%u) on "
+        "this system\n",
+        config.gpu_count, device_count
+    );
+    return -ENOMEM;
+  }
+  std::vector<device_information> devices_;
+  devices_.reserve(device_count);
+  for (unsigned int i = 0; i < device_count; i++) {
+    nvmlDevice_t device = nullptr;
+    nvmlReturn_t return_value = nvmlDeviceGetHandleByIndex(i, &device);
+    if (return_value != NVML_SUCCESS) {
+      fprintf(stderr, "failed to open device %u: %s, skipping.\n", i, nvmlErrorString(return_value));
+      continue;
+    }
+    devices_.emplace_back(device);
+  }
+  std::sort(
+      devices_.begin(), devices_.end(),
+      [](const device_information &lhs, const device_information &rhs) -> bool {
+        return lhs.memory.free > rhs.memory.free;
+      }
+  );
+#ifndef NDEBUG
+  for (const auto &device : devices_) {
+    fprintf(
+        stderr, "%u (%s): %llu / %llu\n", device.id, device.name.c_str(), device.memory.free,
+        device.memory.total
+    );
+  }
+#endif
+  std::vector<device_information> devices;
+  std::copy_if(
+      devices_.cbegin(), devices_.cend(), std::back_inserter(devices),
+      [config](const device_information &device) -> bool {
+        return config.memory_estimation == Configurations::NoEstimation
+                   ? true
+                   : config.memory_estimation < device.memory.free;
+      }
+  );
+  if (devices.size() < config.gpu_count) {
+    fprintf(
+        stderr, "not enough devices with sufficient memory that satisfy "
+                "your request\n"
+    );
+    return -ENOMEM;
+  }
+  std::string devices_to_use;
+  unsigned int count = 0;
+  size_t start = 0;
+  if (config.policy == Configurations::SelectionPolicy::BestFit) {
+    start = devices.size() - config.gpu_count;
+  } else if (config.policy == Configurations::SelectionPolicy::WorstFit) {
+    start = 0;
+  }
+  fprintf(stderr, "running on GPU: ");
+  std::vector<unsigned int> device_ids;
+  device_ids.reserve(config.gpu_count);
+  for (size_t i = start; count < config.gpu_count; i++, count++) {
+    if (!devices_to_use.empty()) {
+      devices_to_use += ',';
+      fprintf(stderr, ", ");
+    }
+    devices_to_use += std::to_string(devices.at(i).id);
+    fprintf(stderr, "%u", devices.at(i).id);
+    device_ids.emplace_back(devices.at(i).id);
+  }
+  fprintf(stderr, "\n");
+  setenv("CUDA_VISIBLE_DEVICES", devices_to_use.c_str(), 1);
+  if (config.direct_exec()) {
+    return do_launch(argv, config);
+  }
+  if (!config.logging_path.empty()) {
+    int pipes[2];
+    pipe(pipes);
+    pid_t pid = fork();
+    if (pid == -1) {
+      perror("cannot fork");
+      return errno;
+    }
+    if (pid == 0) {
+      dup2(pipes[0], STDIN_FILENO);
+      close(pipes[0]);
+      close(pipes[1]);
+      execlp("tee", "tee", config.logging_path.c_str());
+      perror("cannot exec tee");
+      exit(-errno);
+    }
+    fclose(stdout);
+    fclose(stderr);
+    dup2(pipes[1], STDOUT_FILENO);
+    dup2(pipes[1], STDERR_FILENO);
+    close(pipes[0]);
+    close(pipes[1]);
+    stderr = fdopen(STDERR_FILENO, "w");
+    stdout = fdopen(STDOUT_FILENO, "w");
+    setbuf(stderr, nullptr);
+    setbuf(stdout, nullptr);
+  }
+  pid_t pid = fork();
+  if (pid == -1) {
+    perror("cannot fork");
+    return -errno;
+  }
+  if (pid == 0) {
+    return do_launch(argv, config);
+  }
+  timespec start_time;
+  clock_gettime(CLOCK_MONOTONIC, &start_time);
+  if (config.monitor_gpu_memory != 0) {
+    std::thread(gpu_memory_watcher, pid, std::ref(device_ids), std::ref(config)).detach();
+  }
+  int status;
+  waitpid(pid, std::addressof(status), 0);
+  int return_value = 0;
+  if (WIFEXITED(status)) {
+    fprintf(stderr, "program exited with code %d\n", WEXITSTATUS(status));
+    return_value = WEXITSTATUS(status);
+  } else if (WIFSIGNALED(status)) {
+    fprintf(stderr, "program killed with signal %d\n", WTERMSIG(status));
+    return_value = -EINTR;
+  } else {
+    fprintf(stderr, "program terminated, but how?\n");
+    return_value = -EAGAIN;
+  }
+  if (config.timing) {
+    timespec current_time;
+    clock_gettime(CLOCK_MONOTONIC, &current_time);
+    unsigned long long total_time = current_time.tv_sec - start_time.tv_sec;
+    fprintf(stderr, "elapsed time: %s\n", get_readable_duration(total_time).c_str());
+  }
+  return return_value;
+}
