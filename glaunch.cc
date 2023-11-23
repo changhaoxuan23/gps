@@ -20,12 +20,13 @@
 #include <cassert>
 #include <cctype>
 #include <chrono>
+#include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
 #include <functional>
 #include <string>
-#include <string_view>
+#include <sys/prctl.h>
 #include <sys/wait.h>
 #include <thread>
 #include <unistd.h>
@@ -33,7 +34,7 @@
 #include <utility>
 #include <vector>
 #define EXEC_NAME "glaunch"
-#define GLAUNCH_VERSION "v0.0.1"
+#define GLAUNCH_VERSION "v0.0.2"
 struct Configurations {
 private:
   using parser_argument_iterator_t = std::vector<std::string>::const_iterator;
@@ -358,9 +359,35 @@ public:
 
   [[nodiscard]] auto direct_exec() const -> bool { return !this->timing && this->monitor_gpu_memory == 0; }
 };
+// launch the actual process: this function will run in the process which will, by this function, execvp(2)
+//  into the actual process
+// if we have forked off can be checked via !config.direct_exec()
 static auto do_launch(char *argv[], const Configurations &config) -> int {
   // set process group id to group processes forked from the actual computing process
   setpgid(0, 0);
+  if (!config.direct_exec()) { // arrange tasks that shall be done only if we are forking off here
+    // make this process get killed when the controlling glaunch process is killed
+    // note that this takes no effect if the program to be executed has set-user-id/set-group-id or
+    //  capabilities. If not sure, see prctl(2)
+    prctl(PR_SET_PDEATHSIG, SIGKILL);
+  }
+  // logging the command line to be executed
+  fprintf(stderr, "executing: [");
+  for (auto i = config.break_point; argv[i] != nullptr; i++) {
+    if (i != config.break_point) {
+      fprintf(stderr, ", ");
+    }
+    fputc('\'', stderr);
+    for (auto c = argv[i]; *c != '\0'; c++) {
+      if (*c == '\'') {
+        fprintf(stderr, R"('"'"')");
+      } else {
+        fputc(*c, stderr);
+      }
+    }
+    fputc('\'', stderr);
+  }
+  fprintf(stderr, "]...\n");
   execvp(argv[config.break_point], std::addressof(argv[config.break_point]));
   perror("failed to exec");
   return -ENOEXEC;
@@ -485,25 +512,29 @@ auto main(int argc, char *argv[]) -> int {
   }
   fprintf(stderr, "\n");
   setenv("CUDA_VISIBLE_DEVICES", devices_to_use.c_str(), 1);
-  if (config.direct_exec()) {
-    return do_launch(argv, config);
-  }
   if (!config.logging_path.empty()) {
+    // setup logging first: we use tee to do this job, assuming which in installed on the system
+    //  since it is part of the GNU coreutils, it shall be safe to make such an assumption in common cases
     int pipes[2];
-    pipe(pipes);
+    if (pipe(pipes) == -1) {
+      perror("failed to make pipe");
+      return -errno;
+    }
     pid_t pid = fork();
     if (pid == -1) {
       perror("cannot fork");
-      return errno;
+      return -errno;
     }
     if (pid == 0) {
       dup2(pipes[0], STDIN_FILENO);
       close(pipes[0]);
       close(pipes[1]);
-      execlp("tee", "tee", config.logging_path.c_str());
+      execlp("tee", "tee", config.logging_path.c_str(), nullptr);
+      // you shall not be here
       perror("cannot exec tee");
       exit(-errno);
     }
+    // close and reopen stdout/stderr on the pipe
     fclose(stdout);
     fclose(stderr);
     dup2(pipes[1], STDOUT_FILENO);
@@ -514,6 +545,9 @@ auto main(int argc, char *argv[]) -> int {
     stdout = fdopen(STDOUT_FILENO, "w");
     setbuf(stderr, nullptr);
     setbuf(stdout, nullptr);
+  }
+  if (config.direct_exec()) {
+    return do_launch(argv, config);
   }
   pid_t pid = fork();
   if (pid == -1) {

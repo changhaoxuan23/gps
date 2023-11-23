@@ -1,0 +1,6 @@
+v0.0.2
+[BUGFIX][glaunch] fixed unexpected file generation when used with --log option
+[BUGFIX][glaunch] fixed --log option takes no effect when used without --time and --watch-memory
+[ENHANCEMENT][glaunch] now child process launched by glaunch will be killed when glaunch terminates
+[ENHANCEMENT][glaunch] now glaunch will show the command line to be launched by default
+[FEATURE][general] rearrange build procedure with make/Makefile
