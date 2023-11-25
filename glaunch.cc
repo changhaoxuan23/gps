@@ -472,6 +472,16 @@ auto main(int argc, char *argv[]) -> int {
 
   panic_on_failure(nvmlInit);
 
+  // check if there is enough devices accessible from this system
+  unsigned int device_count = 0;
+  panic_on_failure(nvmlDeviceGetCount, &device_count);
+  if (device_count < config.gpu_count) {
+    fprintf(
+        stderr, "requesting %u devices but only %u available on this system\n", config.gpu_count, device_count
+    );
+    return -ENOMEM;
+  }
+
   // wait for free memory
   time_t start_wait_time = time(nullptr);
   std::vector<device_information> available_devices;
@@ -481,6 +491,10 @@ auto main(int argc, char *argv[]) -> int {
       break;
     }
     time_t current_time = time(nullptr);
+    fprintf(
+        stderr, "@%lds: %lu devices usable while %u requested, waiting...\n", current_time - start_wait_time,
+        available_devices.size(), config.gpu_count
+    );
     if (static_cast<unsigned long long>(current_time - start_wait_time) >= config.wait_memory_timeout) {
       fprintf(
           stderr, "not enough devices with sufficient memory that satisfy "
