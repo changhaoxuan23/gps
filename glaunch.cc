@@ -192,38 +192,50 @@ private:
   }
   static void help(parser_argument_iterator_t begin, parser_argument_iterator_t end) {
     assert(begin == end);
-    printf("Launch computational process on proper GPUs regards to "
-           "memory availability\n");
-    printf("Usage: " EXEC_NAME " [OPTIONS...] [--] PROGRAM [ARGS...]\n");
-    printf("OPTIONS:\n");
-    printf("  --gpus GPU_COUNT              Use GPU_COUNT gpus for this program, defaults to 1\n\n");
-    printf("  --memory-budget MEMORY_SIZE   Slight over-estimated size of memory your program will\n");
-    printf("                                 consume per GPU. Suffixes are allowed to simplify this\n");
-    printf("                                 configuration, try KiB, MiB, GiB, etc.. If you do not\n");
-    printf("                                 specify such value, we assume that your program could\n");
-    printf("                                 run with arbitrary amount of memory\n\n");
-    printf("  --policy POLICY               Policy used to select GPU devices. Currently two policies\n");
-    printf("                                 are supported while we defaults to the first one:\n");
-    printf("                                  WorstFit: MAXIMIZE free space after your program launches\n");
-    printf("                                  BestFit: MINIMIZE free space after your program launches\n\n");
-    printf("  --time                        When the program terminates, summary its elapsed time\n\n");
-    printf("  --log PATH                    Duplicate and save stdout and stderr to PATH\n\n");
-    printf("  --watch-memory DURATION       Dump GPU memory usage every DURATION seconds, suffixes are\n");
-    printf("                                 supported, try m, h, d\n\n");
-    printf("  --wait-timeout DURATION       Wait for no more than DURATION if currently no device have\n");
-    printf("                                 sufficient memory launching the specified process. Suffixes\n");
+    printf("Launch computational process on proper GPUs regards to memory availability                   \n");
+    printf("Usage: " EXEC_NAME " [OPTIONS...] [--] PROGRAM [ARGS...]                                     \n");
+    printf("OPTIONS:                                                                                     \n");
+    printf("  --gpus GPU_COUNT              Use GPU_COUNT gpus for this program, defaults to 1           \n");
+    printf("                                                                                             \n");
+    printf("  --memory-budget MEMORY_SIZE   Slight over-estimated size of memory your program will       \n");
+    printf("                                 consume per GPU. Suffixes are allowed to simplify this      \n");
+    printf("                                 configuration, try KiB, MiB, GiB, etc.. If you do not       \n");
+    printf("                                 specify such value, we assume that your program could       \n");
+    printf("                                 run with arbitrary amount of memory                         \n");
+    printf("                                                                                             \n");
+    printf("  --policy POLICY               Policy used to select GPU devices. Currently two policies    \n");
+    printf("                                 are supported while we defaults to the first one:           \n");
+    printf("                                  WorstFit: MAXIMIZE free space after your program launches  \n");
+    printf("                                  BestFit: MINIMIZE free space after your program launches   \n");
+    printf("                                                                                             \n");
+    printf("  --time                        When the program terminates, summary its elapsed time        \n");
+    printf("                                                                                             \n");
+    printf("  --log PATH                    Duplicate and save stdout and stderr to PATH                 \n");
+    printf("                                                                                             \n");
+    printf("  --watch-memory DURATION       Dump GPU memory usage every DURATION seconds, suffixes are   \n");
+    printf("                                 supported, try m, h, d                                      \n");
+    printf("                                                                                             \n");
+    printf("  --wait-timeout DURATION       Wait for no more than DURATION if currently no device have   \n");
+    printf("                                 sufficient memory launching the specified process. Suffixes \n");
     printf("                                 are supported. If --wait-interval is specified while this is\n");
-    printf("                                 not, defaults to 1h\n\n");
-    printf("  --wait-interval DURATION      Check for memory availability for each DURATION seconds.\n");
+    printf("                                 not, defaults to 1h                                         \n");
+    printf("                                                                                             \n");
+    printf("  --wait-interval DURATION      Check for memory availability for each DURATION seconds.     \n");
     printf("                                 Suffixes are supported. If --wait-timeout is specified while\n");
-    printf("                                 this is not, defaults to 1m\n\n");
-    printf("  --help                        Show this message again\n");
-    printf("\n");
-    printf("If you got some trouble on argument parsing, which may be triggered by a program whose name\n");
-    printf(R"( starts with '--', you can add '--' before it to terminate option parsing manually)");
-    printf("\n\n");
-    printf("PROGRAM: the program to launch\n");
-    printf("ARGS: arguments passed to PROGRAM which will not be modified\n");
+    printf("                                 this is not, defaults to 1m                                 \n");
+    printf("                                                                                             \n");
+    printf("  --help                        Show this message again                                      \n");
+    printf("                                                                                             \n");
+    printf("                                                                                             \n");
+    printf("PROGRAM: the program to launch                                                               \n");
+    printf("ARGS: arguments passed to PROGRAM which will not be modified                                 \n");
+    printf("                                                                                             \n");
+    printf("Notes:                                                                                       \n");
+    printf("  There are several options that sets up a DURATION which will be parsed as either a timeout \n");
+    printf("   or an interval. Due to task scheduling and querying/calculating overheads, do not expect  \n");
+    printf("   them to be perfectly accurate: minor mistake will occur                                   \n");
+    printf("  If you got some trouble on argument parsing, which may be triggered by a program whose name\n");
+    printf("   starts with '--', you can add '--' before it to terminate option parsing manually         \n");
     exit(EXIT_SUCCESS);
   }
 
@@ -347,6 +359,8 @@ public:
     fprintf(target, "  timing: %s\n", this->timing ? "true" : "false");
     fprintf(target, "  logging_path: %s\n", this->logging_path.c_str());
     fprintf(target, "  monitor_gpu_memory: %llu\n", this->monitor_gpu_memory);
+    fprintf(target, "  wait_memory_timeout: %llu\n", this->wait_memory_timeout);
+    fprintf(target, "  wait_memory_interval: %llu\n", this->wait_memory_interval);
     fprintf(target, "========== configuration dump ==========\n");
   }
 

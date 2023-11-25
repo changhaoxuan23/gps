@@ -7,3 +7,4 @@ v0.0.2
 [FEATURE][general] W.I.P.: alter representation of device information
 [FEATURE][glaunch] options to wait for free memory
 [CLEANUP][general] rearrange code
+[CLEANUP][gps] fix warning when compiling
