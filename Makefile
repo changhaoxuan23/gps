@@ -19,9 +19,9 @@ release:
 pre-check:
 	@$(NVCC) --version
 build: $(OBJS) $(BINS)
-gps: gps.o
+gps: gps.o nvml_common.o
 	$(NVCC) -o $@ $(LD_FLAGS) $^
-glaunch: glaunch.o
+glaunch: glaunch.o nvml_common.o
 	$(NVCC) -o $@ $(LD_FLAGS) $^
 clean:
 	rm -f $(BINS) $(OBJS)
