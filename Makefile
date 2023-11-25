@@ -12,7 +12,7 @@ BINS = gps glaunch
 
 all: pre-check release
 debug: pre-check
-	@CXX_FLAGS="-g3 -Wall -Wextra" make build
+	@CXX_FLAGS="-g" make build
 release:
 	@CXX_FLAGS="-O3 -DNDEBUG" make build
 	strip -s $(BINS)
