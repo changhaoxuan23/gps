@@ -135,7 +135,8 @@ public:
         } else {
           FILE *file = fdopen(statm_fd, "r");
           // as per linux interface, it is safe to make this assertion
-          assert(fscanf(file, "%*u%llu", std::addressof(this->cpu_memory)) == 1);
+          auto parsed = fscanf(file, "%*u%llu", std::addressof(this->cpu_memory));
+          assert(parsed == 1);
           this->cpu_memory *= get_pagesize();
           fclose(file);
           statm_fd = -1;
@@ -217,13 +218,12 @@ public:
           unsigned long utime, stime;
           unsigned long long starttime;
           // as per linux interface, it is safe to make this assertion
-          assert(
-              fscanf(
-                  file,
-                  "%*d %*s %*c %*d %*d %*d %*d %*d %*u %*u %*u %*u %*u %lu %lu %*d %*d %*d %*d %*d %*d %llu",
-                  std::addressof(utime), std::addressof(stime), std::addressof(starttime)
-              ) == 3
+          auto parsed = fscanf(
+              file,
+              "%*d %*s %*c %*d %*d %*d %*d %*d %*u %*u %*u %*u %*u %lu %lu %*d %*d %*d %*d %*d %*d %llu",
+              std::addressof(utime), std::addressof(stime), std::addressof(starttime)
           );
+          assert(parsed == 3);
           this->timing.fill(utime, stime, starttime);
           fclose(file);
           stat_fd = -1;
