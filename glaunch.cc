@@ -65,6 +65,29 @@ private:
     assert(begin == end);
     target = true;
   }
+  static void duration_saver(
+      unsigned long long &target, parser_argument_iterator_t begin, parser_argument_iterator_t end
+  ) {
+    assert(std::next(begin) == end);
+    size_t pos = 0;
+    try {
+      target = std::stoull(*begin, std::addressof(pos));
+    } catch (const std::exception &e) {
+      fprintf(stderr, "invalid value %s\n", begin->c_str());
+      exit(EXIT_FAILURE);
+    }
+    if (pos != begin->size()) {
+      auto suffix = begin->substr(pos);
+      std::for_each(suffix.begin(), suffix.end(), [](auto &c) { c = tolower(c); });
+      const auto &map = get_duration_suffix_map();
+      auto iter = map.find(suffix);
+      if (iter == map.cend()) {
+        fprintf(stderr, "invalid suffix %s\n", begin->substr(pos).c_str());
+        exit(EXIT_FAILURE);
+      }
+      target *= iter->second;
+    }
+  }
   static void
   parser_dispatcher(const Option &option, size_t &break_point, const std::vector<std::string> &args) {
     if (args[break_point] == option.name) {
@@ -97,50 +120,6 @@ private:
       return true;
     }
     return false;
-  }
-  static auto get_size_suffix_map() -> const std::unordered_map<std::string, unsigned long long> & {
-    static bool initialize = true;
-    static std::unordered_map<std::string, unsigned long long> map;
-    if (initialize) {
-      map.insert({"kib", 1024ull});
-      map.insert({"kb", 1024ull});
-      map.insert({"k", 1024ull});
-
-      map.insert({"mib", 1024ull * 1024});
-      map.insert({"mb", 1024ull * 1024});
-      map.insert({"m", 1024ull * 1024});
-
-      map.insert({"gib", 1024ull * 1024 * 1024});
-      map.insert({"gb", 1024ull * 1024 * 1024});
-      map.insert({"g", 1024ull * 1024 * 1024});
-
-      map.insert({"tib", 1024ull * 1024 * 1024 * 1024});
-      map.insert({"tb", 1024ull * 1024 * 1024 * 1024});
-      map.insert({"t", 1024ull * 1024 * 1024 * 1024});
-
-      map.insert({"pib", 1024ull * 1024 * 1024 * 1024 * 1024});
-      map.insert({"pb", 1024ull * 1024 * 1024 * 1024 * 1024});
-      map.insert({"p", 1024ull * 1024 * 1024 * 1024 * 1024});
-    }
-    return map;
-  }
-  static auto get_duration_suffix_map() -> const std::unordered_map<std::string, unsigned long long> & {
-    static bool initialize = true;
-    static std::unordered_map<std::string, unsigned long long> map;
-    if (initialize) {
-      map.insert({"m", 60ull});
-      map.insert({"minute", 60ull});
-      map.insert({"minutes", 60ull});
-
-      map.insert({"h", 60ull * 60});
-      map.insert({"hour", 60ull * 60});
-      map.insert({"hours", 60ull * 60});
-
-      map.insert({"d", 60ull * 60 * 24});
-      map.insert({"day", 60ull * 60 * 24});
-      map.insert({"days", 60ull * 60 * 24});
-    }
-    return map;
   }
   void parse_gpu_count(parser_argument_iterator_t begin, parser_argument_iterator_t end) {
     assert(std::next(begin) == end);
@@ -199,25 +178,16 @@ private:
     assert(std::next(begin) == end);
     this->logging_path = *begin;
   }
-  void parse_monitor_gpu_memory(parser_argument_iterator_t begin, parser_argument_iterator_t end) {
-    assert(std::next(begin) == end);
-    size_t pos = 0;
-    try {
-      this->monitor_gpu_memory = std::stoull(*begin, std::addressof(pos));
-    } catch (const std::exception &e) {
-      fprintf(stderr, "invalid value %s\n", begin->c_str());
-      exit(EXIT_FAILURE);
+  void parse_wait_memory_timeout(parser_argument_iterator_t begin, parser_argument_iterator_t end) {
+    duration_saver(this->wait_memory_timeout, begin, end);
+    if (this->wait_memory_interval == 0) {
+      this->wait_memory_interval = 60;
     }
-    if (pos != begin->size()) {
-      auto suffix = begin->substr(pos);
-      std::for_each(suffix.begin(), suffix.end(), [](auto &c) { c = tolower(c); });
-      const auto &map = get_duration_suffix_map();
-      auto iter = map.find(suffix);
-      if (iter == map.cend()) {
-        fprintf(stderr, "invalid suffix %s\n", begin->substr(pos).c_str());
-        exit(EXIT_FAILURE);
-      }
-      this->monitor_gpu_memory *= iter->second;
+  }
+  void parse_wait_memory_interval(parser_argument_iterator_t begin, parser_argument_iterator_t end) {
+    duration_saver(this->wait_memory_interval, begin, end);
+    if (this->wait_memory_timeout == 0) {
+      this->wait_memory_timeout = 3600;
     }
   }
   static void help(parser_argument_iterator_t begin, parser_argument_iterator_t end) {
@@ -238,8 +208,15 @@ private:
     printf("                                  BestFit: MINIMIZE free space after your program launches\n\n");
     printf("  --time                        When the program terminates, summary its elapsed time\n\n");
     printf("  --log PATH                    Duplicate and save stdout and stderr to PATH\n\n");
-    printf("  --watch-memory INTERVAL       Dump GPU memory usage every INTERVAL seconds, suffixes are\n");
+    printf("  --watch-memory DURATION       Dump GPU memory usage every DURATION seconds, suffixes are\n");
     printf("                                 supported, try m, h, d\n\n");
+    printf("  --wait-timeout DURATION       Wait for no more than DURATION if currently no device have\n");
+    printf("                                 sufficient memory launching the specified process. Suffixes\n");
+    printf("                                 are supported. If --wait-interval is specified while this is\n");
+    printf("                                 not, defaults to 1h\n\n");
+    printf("  --wait-interval DURATION      Check for memory availability for each DURATION seconds.\n");
+    printf("                                 Suffixes are supported. If --wait-timeout is specified while\n");
+    printf("                                 this is not, defaults to 1m\n\n");
     printf("  --help                        Show this message again\n");
     printf("\n");
     printf("If you got some trouble on argument parsing, which may be triggered by a program whose name\n");
@@ -279,6 +256,10 @@ public:
 
   // time interval between two samples on GPU memory consumption are taken
   unsigned long long monitor_gpu_memory{0};
+
+  // wait-for-free-memory
+  unsigned long long wait_memory_timeout{0};
+  unsigned long long wait_memory_interval{0};
 
   Configurations(const std::vector<std::string> &args) {
     this->break_point = 1;
@@ -321,9 +302,21 @@ public:
     );
     options.emplace_back(
         [this](parser_argument_iterator_t begin, parser_argument_iterator_t end) {
-          this->parse_monitor_gpu_memory(begin, end);
+          duration_saver(this->monitor_gpu_memory, begin, end);
         },
         "--watch-memory", 1
+    );
+    options.emplace_back(
+        [this](parser_argument_iterator_t begin, parser_argument_iterator_t end) {
+          this->parse_wait_memory_timeout(begin, end);
+        },
+        "--wait-timeout", 1
+    );
+    options.emplace_back(
+        [this](parser_argument_iterator_t begin, parser_argument_iterator_t end) {
+          this->parse_wait_memory_interval(begin, end);
+        },
+        "--wait-interval", 1
     );
 
     while (this->break_point < args.size() && args[this->break_point].substr(0, 2).compare("--") == 0) {
@@ -426,29 +419,10 @@ static void gpu_memory_watcher(
     fprintf(stderr, "%s %s GPU memory in use\n", buffer, get_readable_size(total_memory).c_str());
   }
 }
-auto main(int argc, char *argv[]) -> int {
-  fprintf(stdout, EXEC_NAME " " GLAUNCH_VERSION " licensed under AGPLv3 or later\n");
-  fprintf(stdout, "you can goto https://github.com/changhaoxuan23/gps for source code\n\n");
-  std::vector<std::string> args;
-  args.reserve(argc);
-  for (int i = 0; i < argc; i++) {
-    args.emplace_back(argv[i]);
-  }
-  Configurations config(args);
-  config.dump(stdout);
-
-  panic_on_failure(nvmlInit_v2);
+// get devices with sufficient memory, sort in decreasing order of free memory
+static auto get_available_devices(const Configurations &config) -> std::vector<device_information> {
   unsigned int device_count = 0;
   panic_on_failure(nvmlDeviceGetCount, &device_count);
-  if (device_count < config.gpu_count) {
-    fprintf(
-        stderr,
-        "requesting %u GPUs which is more than the number of GPUs (%u) on "
-        "this system\n",
-        config.gpu_count, device_count
-    );
-    return -ENOMEM;
-  }
   std::vector<device_information> devices_;
   devices_.reserve(device_count);
   for (unsigned int i = 0; i < device_count; i++) {
@@ -483,18 +457,49 @@ auto main(int argc, char *argv[]) -> int {
                    : config.memory_estimation < device.memory.free;
       }
   );
-  if (devices.size() < config.gpu_count) {
-    fprintf(
-        stderr, "not enough devices with sufficient memory that satisfy "
-                "your request\n"
-    );
-    return -ENOMEM;
+  return devices;
+}
+auto main(int argc, char *argv[]) -> int {
+  fprintf(stdout, EXEC_NAME " " GLAUNCH_VERSION " licensed under AGPLv3 or later\n");
+  fprintf(stdout, "you can goto https://github.com/changhaoxuan23/gps for source code\n\n");
+  std::vector<std::string> args;
+  args.reserve(argc);
+  for (int i = 0; i < argc; i++) {
+    args.emplace_back(argv[i]);
+  }
+  Configurations config(args);
+  config.dump(stdout);
+
+  panic_on_failure(nvmlInit);
+
+  // wait for free memory
+  time_t start_wait_time = time(nullptr);
+  std::vector<device_information> available_devices;
+  while (true) {
+    available_devices = get_available_devices(config);
+    if (available_devices.size() >= config.gpu_count) {
+      break;
+    }
+    time_t current_time = time(nullptr);
+    if (static_cast<unsigned long long>(current_time - start_wait_time) >= config.wait_memory_timeout) {
+      fprintf(
+          stderr, "not enough devices with sufficient memory that satisfy "
+                  "your request\n"
+      );
+      return -ENOMEM;
+    }
+    unsigned int time_to_timeout = config.wait_memory_timeout - (current_time - start_wait_time);
+    unsigned int time_to_sleep =
+        time_to_timeout < config.wait_memory_interval ? time_to_timeout : config.wait_memory_interval;
+    while (time_to_sleep > 0) {
+      time_to_sleep = sleep(time_to_sleep);
+    }
   }
   std::string devices_to_use;
   unsigned int count = 0;
   size_t start = 0;
   if (config.policy == Configurations::SelectionPolicy::BestFit) {
-    start = devices.size() - config.gpu_count;
+    start = available_devices.size() - config.gpu_count;
   } else if (config.policy == Configurations::SelectionPolicy::WorstFit) {
     start = 0;
   }
@@ -506,9 +511,9 @@ auto main(int argc, char *argv[]) -> int {
       devices_to_use += ',';
       fprintf(stderr, ", ");
     }
-    devices_to_use += std::to_string(devices.at(i).id);
-    fprintf(stderr, "%u", devices.at(i).id);
-    device_ids.emplace_back(devices.at(i).id);
+    devices_to_use += std::to_string(available_devices.at(i).id);
+    fprintf(stderr, "%u", available_devices.at(i).id);
+    device_ids.emplace_back(available_devices.at(i).id);
   }
   fprintf(stderr, "\n");
   setenv("CUDA_VISIBLE_DEVICES", devices_to_use.c_str(), 1);

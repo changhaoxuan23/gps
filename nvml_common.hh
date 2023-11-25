@@ -18,14 +18,21 @@
 #ifndef NVML_COMMON_HH_
 #define NVML_COMMON_HH_
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <nvml.h>
+#include <optional>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
+// assert successful API call to NVML
+//  on failure, this macro shows the name of the failed call, shows a string explaining the error provided by
+//  NVML, and terminate the process with exit(EXIT_FAILURE)
+// parameters: the API function followed by all arguments to be passed to such API
 #define panic_on_failure(nvml_call, ...)                                                                     \
   do {                                                                                                       \
     nvmlReturn_t return_value = nvml_call(__VA_ARGS__);                                                      \
@@ -34,10 +41,30 @@
       exit(EXIT_FAILURE);                                                                                    \
     }                                                                                                        \
   } while (false)
+
+// structure representing throughput measured by B/s
+struct throughput {
+  unsigned long long receive;
+  unsigned long long transmit;
+};
+
+// information of a device
+//  W.I.P, fields in this struct are subject to change
 struct device_information {
-  unsigned int id;     // index of the device
-  std::string name;    // name of the device
-  nvmlMemory_t memory; // memory statistics
+  // stable information, these information is not likely to change in a relative long period
+  nvmlDevice_t handle;               // the handle of device
+  unsigned int id;                   // index of the device
+  std::string name;                  // name of the device
+  std::string serial;                // board serial number of the device
+  nvmlPciInfo_t pci;                 // PCI bus information about the device
+  std::optional<std::string> uuid;   // uuid of the device, might unavailable
+  nvmlDeviceAttributes_t attributes; // attributes of the device
+
+  // volatile information, these information may change rapidly
+  // time point at which volatile information is sampled
+  std::chrono::time_point<std::chrono::system_clock> sample_time;
+  throughput pcie_throughput; // throughput of PCIe
+  nvmlMemory_t memory;        // memory statistics
 
   // construct by directly query with the NVML library
   device_information(nvmlDevice_t device) {
@@ -66,78 +93,31 @@ struct device_information {
     }
   }
 };
-static auto get_processes_on_device(nvmlDevice_t device)
-    -> std::pair<nvmlReturn_t, std::vector<nvmlProcessInfo_t>> {
-  unsigned int process_count = 0;
-  nvmlProcessInfo_t *information = nullptr;
-  nvmlReturn_t return_value;
-  while (true) {
-    // since the number of process may change, we need to loop and keep increasing the size of buffer until
-    //  we can finally during some call to the API have sufficient space for all processes running
-    return_value = nvmlDeviceGetComputeRunningProcesses(device, &process_count, information);
-    if (return_value != NVML_ERROR_INSUFFICIENT_SIZE) {
-      if (return_value != NVML_SUCCESS) {
-        free(information);
-        information = nullptr;
-      }
-      break;
-    } else {
-      void *new_buffer = realloc(information, sizeof(nvmlProcessInfo_t) * process_count);
-      if (new_buffer == nullptr) {
-        free(information);
-        information = nullptr;
-        return_value = NVML_ERROR_INSUFFICIENT_SIZE;
-        break;
-      }
-      information = static_cast<nvmlProcessInfo_t *>(new_buffer);
-    }
-  }
-  if (information == nullptr) {
-    return std::make_pair(return_value, std::vector<nvmlProcessInfo_t>());
-  }
-  std::vector<nvmlProcessInfo_t> result(information, information + process_count);
-  return std::make_pair(NVML_SUCCESS, result);
-}
-static inline auto get_readable_duration(unsigned long long seconds) -> std::string {
-  const static std::array<std::string, 4> suffixes = {"day(s)", "hour(s)", "minute(s)", "second(s)"};
-  const static std::array<unsigned int, 4> ratios = {0, 24, 60, 60};
-  std::array<unsigned long long, 4> values;
-  values.back() = seconds;
-  for (size_t i = values.size() - 1; i != 0; i--) {
-    values.at(i - 1) = values.at(i) / ratios.at(i);
-    values.at(i) %= ratios.at(i);
-  }
-  bool start = false;
-  std::string result;
-  for (size_t i = 0; i < values.size(); i++) {
-    if (values.at(i) != 0) {
-      start = true;
-    }
-    if (start) {
-      result += std::to_string(values.at(i)) + " " + suffixes.at(i);
-      if (i != values.size() - 1) {
-        result += ", ";
-      }
-    }
-  }
-  if (!start) {
-    result = "0 second";
-  }
-  return result;
-}
-static inline auto get_readable_size(unsigned long long value) -> std::string {
-  std::array<std::string, 6> suffixes = {"B", "KiB", "MiB", "GiB", "TiB", "PiB"};
-  long double temporary = value;
-  unsigned int selection = 0;
-  while (selection < suffixes.size() - 1) {
-    if (temporary / 1024 > 1000) {
-      temporary /= 1024;
-      selection += 1;
-    } else {
-      break;
-    }
-  }
-  value = static_cast<unsigned long long>(std::round(temporary));
-  return std::to_string(value) + suffixes[selection];
-}
+
+// get information of all computation processes on given device specified by a device handle
+//  return a std::pair, in which the first element has type nvmlReturn_t that is the return value from
+//   underlying API call, while the second element has type std::vector<nvmlProcessInfo_t>> that is an array
+//   of structures defined by NVML, one for each process running on the given device, contains valid content
+//   if and only if the first element in the pair indicates a successful call
+auto get_processes_on_device(nvmlDevice_t device) -> std::pair<nvmlReturn_t, std::vector<nvmlProcessInfo_t>>;
+
+// get human-readable representation of duration given in unit of seconds
+//  due to ambiguity, no unit representing more seconds than day will be involved in the result, that is, only
+//  the following units may be employed:
+//    day    ---- 86400s
+//    hour   ----  3600s
+//    minute ----    60s
+//    second ----     1s
+auto get_readable_duration(unsigned long long seconds) -> std::string;
+
+// get human-readable representation of size given in unit of byte
+auto get_readable_size(unsigned long long value) -> std::string;
+
+// get mapping from size suffixes to multiplier
+//  for simplicity, suffixes are converted into lowercase
+auto get_size_suffix_map() -> const std::unordered_map<std::string, unsigned long long> &;
+
+// get mapping from duration suffixes to multiplier
+//  for simplicity, suffixes are converted into lowercase
+auto get_duration_suffix_map() -> const std::unordered_map<std::string, unsigned long long> &;
 #endif

@@ -4,3 +4,6 @@ v0.0.2
 [ENHANCEMENT][glaunch] now child process launched by glaunch will be killed when glaunch terminates
 [ENHANCEMENT][glaunch] now glaunch will show the command line to be launched by default
 [FEATURE][general] rearrange build procedure with make/Makefile
+[FEATURE][general] W.I.P.: alter representation of device information
+[FEATURE][glaunch] options to wait for free memory
+[CLEANUP][general] rearrange code

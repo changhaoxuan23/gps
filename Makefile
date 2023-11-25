@@ -12,9 +12,9 @@ BINS = gps glaunch
 
 all: pre-check release
 debug: pre-check
-	-CXX_FLAGS="-g3" make build
+	@CXX_FLAGS="-g3" make build
 release:
-	-CXX_FLAGS="-O3" make build
+	@CXX_FLAGS="-O3" make build
 	strip -s $(BINS)
 pre-check:
 	@$(NVCC) --version
