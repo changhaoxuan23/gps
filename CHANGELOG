@@ -6,5 +6,6 @@ v0.0.2
 [FEATURE][general] rearrange build procedure with make/Makefile
 [FEATURE][general] W.I.P.: alter representation of device information
 [FEATURE][glaunch] options to wait for free memory
+[FEATURE][glaunch] options to run in background / and in detached mode
 [CLEANUP][general] rearrange code
 [CLEANUP][gps] fix warning when compiling
