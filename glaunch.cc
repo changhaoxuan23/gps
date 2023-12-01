@@ -175,11 +175,6 @@ private:
       exit(EXIT_FAILURE);
     }
   }
-  void parse_detach(parser_argument_iterator_t begin, parser_argument_iterator_t end) {
-    assert(std::next(begin) == end);
-    this->detach = true;
-    this->fork = true;
-  }
   void parse_logging_path(parser_argument_iterator_t begin, parser_argument_iterator_t end) {
     assert(std::next(begin) == end);
     this->logging_path = *begin;
@@ -216,15 +211,12 @@ private:
     printf("                                                                                             \n");
     printf("  --time                        When the program terminates, summary its elapsed time        \n");
     printf("                                                                                             \n");
-    printf("  --fork                        Return after the process is launched, effectively run it in  \n");
+    printf("  --background                  Return after the process is launched, effectively run it in  \n");
     printf("                                 background. This will also remap opened file descriptors so \n");
     printf("                                 that stdin/stdout/stderr of the launched process will refer \n");
-    printf("                                 to /dev/null, unless --log is specified                     \n");
-    printf("                                                                                             \n");
-    printf("  --detach                      Detach the launched process from the session in which it is  \n");
-    printf("                                 launched, effectively stops it from being terminated after  \n");
-    printf("                                 the user has logged out or the shell itself has terminated. \n");
-    printf("                                 Implies --fork                                              \n");
+    printf("                                 to /dev/null, unless --log is specified. When the process   \n");
+    printf("                                 runs in background, it will not be sent SIGHUP when you log \n");
+    printf("                                 out, the shell you used to launch it is closed/killed, etc. \n");
     printf("                                                                                             \n");
     printf("  --log PATH                    Duplicate and save stdout and stderr to PATH                 \n");
     printf("                                                                                             \n");
@@ -280,10 +272,7 @@ public:
   bool timing{false};
 
   // if we shall fork before proceed so that we can run in background
-  bool fork{false};
-
-  // if we shall setsid(2) after forking off
-  bool detach{false};
+  bool background{false};
 
   // destination path to duplicate and store output from the program
   std::string logging_path{};
@@ -330,15 +319,9 @@ public:
     );
     options.emplace_back(
         [this](parser_argument_iterator_t begin, parser_argument_iterator_t end) {
-          Configurations::true_saver(this->fork, begin, end);
+          Configurations::true_saver(this->background, begin, end);
         },
         "--fork", 0
-    );
-    options.emplace_back(
-        [this](parser_argument_iterator_t begin, parser_argument_iterator_t end) {
-          this->parse_detach(begin, end);
-        },
-        "--detach", 0
     );
     options.emplace_back(
         [this](parser_argument_iterator_t begin, parser_argument_iterator_t end) {
@@ -391,8 +374,7 @@ public:
     fprintf(target, "  memory_estimation: %llu\n", this->memory_estimation);
     fprintf(target, "  policy: %s\n", this->policy == SelectionPolicy::BestFit ? "BestFit" : "WorstFit");
     fprintf(target, "  timing: %s\n", this->timing ? "true" : "false");
-    fprintf(target, "  fork: %s\n", this->fork ? "true" : "false");
-    fprintf(target, "  detach: %s\n", this->detach ? "true" : "false");
+    fprintf(target, "  background: %s\n", this->background ? "true" : "false");
     fprintf(target, "  logging_path: %s\n", this->logging_path.c_str());
     fprintf(target, "  monitor_gpu_memory: %llu\n", this->monitor_gpu_memory);
     fprintf(target, "  wait_memory_timeout: %llu\n", this->wait_memory_timeout);
@@ -580,7 +562,7 @@ auto main(int argc, char *argv[]) -> int {
     device_ids.emplace_back(available_devices.at(i).id);
   }
   fprintf(stderr, "\n");
-  if (config.fork) {
+  if (config.background) {
     pid_t pid = fork();
     if (pid == -1) {
       perror("failed to fork");
@@ -608,11 +590,6 @@ auto main(int argc, char *argv[]) -> int {
       setbuf(stderr, nullptr);
       setbuf(stdout, nullptr);
     }
-  }
-  if (config.detach) {
-    // since --detach implies --fork, only the forked process may run this code, therefore a setsid(2) call
-    //  will always succeed
-    setsid(); // this shall be sufficient
   }
   setenv("CUDA_VISIBLE_DEVICES", devices_to_use.c_str(), 1);
   if (!config.logging_path.empty()) {
