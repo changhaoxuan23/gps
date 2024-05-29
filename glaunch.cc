@@ -1,5 +1,6 @@
-// glaunch - Launch computational process on proper GPUs regards to memory availability
-// Copyright (C) 2023 Haoxuan Chang<changhaoxuan23@mails.ucas.ac.cn>
+// glaunch - Launch computational process on proper GPUs regards to memory
+// availability Copyright (C) 2023-2024 Haoxuan
+// Chang<changhaoxuan23@mails.ucas.ac.cn>
 
 // This is part of gps.
 // This program is free software: you can redistribute it and/or modify
@@ -17,493 +18,560 @@
 
 #include "nvml_common.hh"
 #include <algorithm>
+#include <array>
 #include <cassert>
 #include <cctype>
 #include <chrono>
+#include <configuration.hh>
+#include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
+#include <fcntl.h>
 #include <functional>
+#include <print>
 #include <string>
-#include <string_view>
+#include <sys/epoll.h>
+#include <sys/prctl.h>
+#include <sys/syscall.h>
 #include <sys/wait.h>
 #include <thread>
 #include <unistd.h>
 #include <unordered_map>
-#include <utility>
 #include <vector>
-#define EXEC_NAME "glaunch"
-#define GLAUNCH_VERSION "v0.0.1"
-struct Configurations {
-private:
-  using parser_argument_iterator_t = std::vector<std::string>::const_iterator;
-  using parser_t = std::function<void(parser_argument_iterator_t, parser_argument_iterator_t)>;
-  struct Option {
-    const parser_t parser;
-    std::string name;
-    size_t argument_count;
+#ifdef HAVE_SECRET_STORAGE
+#include <secret_storage_accessor.hh>
+#endif
 
-    Option(parser_t parser, std::string name, size_t argument_count)
-        : parser(std::move(parser)), name(std::move(name)), argument_count(argument_count) {}
+struct Options {
+  enum class SelectionPolicy { BestFit, WorstFit };
+  bool            background;
+  bool            timing;
+  uint16_t        gpu_count;
+  SelectionPolicy policy;
+  uint32_t        wait_memory_timeout;
+  std::string     logging_path;
+  size_t          break_point;
+  uint64_t        monitor_gpu_memory;
+  size_t          memory_estimation;
+#ifdef HAVE_SECRET_STORAGE
+  std::string email_server;
+  uint16_t    email_port;
+#endif
+  [[nodiscard]] auto direct_exec() const -> bool {
+    return !this->timing && this->monitor_gpu_memory == 0
+#ifdef HAVE_SECRET_STORAGE
+        && this->email_port == 0
+#endif
+      ;
   };
-  template <typename T> static auto full_convert_ull(const std::string &value) -> T {
-    size_t pos = 0;
-    unsigned long long result;
-    try {
-      result = std::stoi(value, std::addressof(pos));
-    } catch (const std::exception &error) {
-      pos = 0;
-    }
-    if (value.size() == 0 || pos == 0) {
-      fprintf(stderr, "cannot convert %s.\n", value.c_str());
-      exit(EXIT_FAILURE);
-    }
-    return static_cast<T>(result);
-  }
-  static void true_saver(bool &target, parser_argument_iterator_t begin, parser_argument_iterator_t end) {
-    assert(begin == end);
-    target = true;
-  }
-  static void
-  parser_dispatcher(const Option &option, size_t &break_point, const std::vector<std::string> &args) {
-    if (args[break_point] == option.name) {
-      if (args.size() <= break_point + option.argument_count) {
-        fprintf(stderr, "%s expects arguments but not provided\n", option.name.c_str());
-        exit(EXIT_FAILURE);
-      }
-      auto step = static_cast<parser_argument_iterator_t::difference_type>(++break_point);
-      option.parser(
-          std::next(args.cbegin(), step),
-          std::next(args.cbegin(), step + static_cast<decltype(step)>(option.argument_count))
-      );
-      break_point += option.argument_count;
-    } else if (option.argument_count == 1 && args[break_point].substr(0, option.name.size() + 1) == (option.name + '=')) {
-      std::vector<std::string> temporary;
-      temporary.emplace_back(args[break_point++].substr(option.name.size() + 1));
-      option.parser(temporary.cbegin(), temporary.cend());
+
+  Options(std::unordered_map<std::string, std::any> parse_result) {
+    if (parse_result.contains("gpus")) {
+      this->gpu_count = std::any_cast<uint16_t>(parse_result.at("gpus"));
     } else {
-      fprintf(
-          stderr, "invalid option string %s with option name %s\n", args[break_point].c_str(),
-          option.name.c_str()
-      );
-      exit(EXIT_FAILURE);
+      this->gpu_count = 1;
     }
-  }
-  static auto test_option(const Option &option, size_t &break_point, const std::vector<std::string> &args)
-      -> bool {
-    if (args[break_point].substr(0, option.name.size()) == option.name) {
-      parser_dispatcher(option, break_point, args);
-      return true;
-    }
-    return false;
-  }
-  static auto get_size_suffix_map() -> const std::unordered_map<std::string, unsigned long long> & {
-    static bool initialize = true;
-    static std::unordered_map<std::string, unsigned long long> map;
-    if (initialize) {
-      map.insert({"kib", 1024ull});
-      map.insert({"kb", 1024ull});
-      map.insert({"k", 1024ull});
 
-      map.insert({"mib", 1024ull * 1024});
-      map.insert({"mb", 1024ull * 1024});
-      map.insert({"m", 1024ull * 1024});
+    if (parse_result.contains("memory-budget")) {
+      this->memory_estimation = std::any_cast<unsigned long long>(parse_result.at("memory-budget"));
+    } else {
+      this->memory_estimation = 0;
+    }
 
-      map.insert({"gib", 1024ull * 1024 * 1024});
-      map.insert({"gb", 1024ull * 1024 * 1024});
-      map.insert({"g", 1024ull * 1024 * 1024});
-
-      map.insert({"tib", 1024ull * 1024 * 1024 * 1024});
-      map.insert({"tb", 1024ull * 1024 * 1024 * 1024});
-      map.insert({"t", 1024ull * 1024 * 1024 * 1024});
-
-      map.insert({"pib", 1024ull * 1024 * 1024 * 1024 * 1024});
-      map.insert({"pb", 1024ull * 1024 * 1024 * 1024 * 1024});
-      map.insert({"p", 1024ull * 1024 * 1024 * 1024 * 1024});
-    }
-    return map;
-  }
-  static auto get_duration_suffix_map() -> const std::unordered_map<std::string, unsigned long long> & {
-    static bool initialize = true;
-    static std::unordered_map<std::string, unsigned long long> map;
-    if (initialize) {
-      map.insert({"m", 60ull});
-      map.insert({"minute", 60ull});
-      map.insert({"minutes", 60ull});
-
-      map.insert({"h", 60ull * 60});
-      map.insert({"hour", 60ull * 60});
-      map.insert({"hours", 60ull * 60});
-
-      map.insert({"d", 60ull * 60 * 24});
-      map.insert({"day", 60ull * 60 * 24});
-      map.insert({"days", 60ull * 60 * 24});
-    }
-    return map;
-  }
-  void parse_gpu_count(parser_argument_iterator_t begin, parser_argument_iterator_t end) {
-    assert(std::next(begin) == end);
-    if (this->gpu_count != 1) {
-      fprintf(stderr, "multiple instance of option --gpus, the last one takes effect\n");
-    }
-    this->gpu_count = full_convert_ull<unsigned int>(*begin);
-    if (this->gpu_count > 16) {
-      fprintf(stderr, "%u GPUs? Amazing, you lucky guy!\n", this->gpu_count);
-    }
-  }
-  void parse_memory_estimation(parser_argument_iterator_t begin, parser_argument_iterator_t end) {
-    assert(std::next(begin) == end);
-    if (this->memory_estimation != NoEstimation) {
-      fprintf(
-          stderr, "multiple instance of option --memory-budget, the last "
-                  "one takes effect\n"
-      );
-    }
-    size_t pos = 0;
-    try {
-      this->memory_estimation = std::stoull(*begin, std::addressof(pos));
-    } catch (const std::exception &e) {
-      fprintf(stderr, "invalid value %s\n", begin->c_str());
-      exit(EXIT_FAILURE);
-    }
-    if (pos != begin->size()) {
-      auto suffix = begin->substr(pos);
-      std::for_each(suffix.begin(), suffix.end(), [](auto &c) { c = tolower(c); });
-      const auto &map = get_size_suffix_map();
-      auto iter = map.find(suffix);
-      if (iter == map.cend()) {
-        fprintf(stderr, "invalid suffix %s\n", begin->substr(pos).c_str());
-        exit(EXIT_FAILURE);
-      }
-      this->memory_estimation *= iter->second;
-    }
-    if (this->memory_estimation > 0x2000000000ull) {
-      fprintf(stderr, "%llu bytes! you must be doing something fascinating!\n", this->memory_estimation);
-    }
-  }
-  void parse_policy(parser_argument_iterator_t begin, parser_argument_iterator_t end) {
-    assert(std::next(begin) == end);
-    std::string test(*begin);
-    std::for_each(test.begin(), test.end(), [](auto &c) { c = tolower(c); });
-    if (test.compare("worst") == 0 || test.compare("worstfit") == 0) {
+    if (parse_result.contains("policy")) {
+      this->policy = std::any_cast<Options::SelectionPolicy>(parse_result.at("policy"));
+    } else {
       this->policy = SelectionPolicy::WorstFit;
-    } else if (test.compare("best") == 0 || test.compare("bestfit") == 0) {
-      this->policy = SelectionPolicy::BestFit;
+    }
+
+    this->timing     = parse_result.contains("time");
+    this->background = parse_result.contains("background");
+
+    if (parse_result.contains("log")) {
+      this->logging_path = std::any_cast<std::string>(parse_result.at("log"));
     } else {
-      fprintf(stderr, "invalid policy %s\n", begin->c_str());
-      exit(EXIT_FAILURE);
+      this->logging_path = "";
     }
-  }
-  void parse_logging_path(parser_argument_iterator_t begin, parser_argument_iterator_t end) {
-    assert(std::next(begin) == end);
-    this->logging_path = *begin;
-  }
-  void parse_monitor_gpu_memory(parser_argument_iterator_t begin, parser_argument_iterator_t end) {
-    assert(std::next(begin) == end);
-    size_t pos = 0;
-    try {
-      this->monitor_gpu_memory = std::stoull(*begin, std::addressof(pos));
-    } catch (const std::exception &e) {
-      fprintf(stderr, "invalid value %s\n", begin->c_str());
-      exit(EXIT_FAILURE);
+
+    if (parse_result.contains("watch-memory")) {
+      this->monitor_gpu_memory = std::any_cast<unsigned long long>(parse_result.at("watch-memory"));
+    } else {
+      this->monitor_gpu_memory = 0;
     }
-    if (pos != begin->size()) {
-      auto suffix = begin->substr(pos);
-      std::for_each(suffix.begin(), suffix.end(), [](auto &c) { c = tolower(c); });
-      const auto &map = get_duration_suffix_map();
-      auto iter = map.find(suffix);
-      if (iter == map.cend()) {
-        fprintf(stderr, "invalid suffix %s\n", begin->substr(pos).c_str());
-        exit(EXIT_FAILURE);
-      }
-      this->monitor_gpu_memory *= iter->second;
+
+    if (parse_result.contains("wait-timeout")) {
+      this->wait_memory_timeout = std::any_cast<unsigned long long>(parse_result.at("wait-timeout"));
+    } else {
+      this->wait_memory_timeout = 0;
     }
-  }
-  static void help(parser_argument_iterator_t begin, parser_argument_iterator_t end) {
-    assert(begin == end);
-    printf("Launch computational process on proper GPUs regards to "
-           "memory availability\n");
-    printf("Usage: " EXEC_NAME " [OPTIONS...] [--] PROGRAM [ARGS...]\n");
-    printf("OPTIONS:\n");
-    printf("  --gpus GPU_COUNT              Use GPU_COUNT gpus for this program, defaults to 1\n\n");
-    printf("  --memory-budget MEMORY_SIZE   Slight over-estimated size of memory your program will\n");
-    printf("                                 consume per GPU. Suffixes are allowed to simplify this\n");
-    printf("                                 configuration, try KiB, MiB, GiB, etc.. If you do not\n");
-    printf("                                 specify such value, we assume that your program could\n");
-    printf("                                 run with arbitrary amount of memory\n\n");
-    printf("  --policy POLICY               Policy used to select GPU devices. Currently two policies\n");
-    printf("                                 are supported while we defaults to the first one:\n");
-    printf("                                  WorstFit: MAXIMIZE free space after your program launches\n");
-    printf("                                  BestFit: MINIMIZE free space after your program launches\n\n");
-    printf("  --time                        When the program terminates, summary its elapsed time\n\n");
-    printf("  --log PATH                    Duplicate and save stdout and stderr to PATH\n\n");
-    printf("  --watch-memory INTERVAL       Dump GPU memory usage every INTERVAL seconds, suffixes are\n");
-    printf("                                 supported, try m, h, d\n\n");
-    printf("  --help                        Show this message again\n");
-    printf("\n");
-    printf("If you got some trouble on argument parsing, which may be triggered by a program whose name\n");
-    printf(R"( starts with '--', you can add '--' before it to terminate option parsing manually)");
-    printf("\n\n");
-    printf("PROGRAM: the program to launch\n");
-    printf("ARGS: arguments passed to PROGRAM which will not be modified\n");
-    exit(EXIT_SUCCESS);
-  }
 
-public:
-  static constexpr unsigned long long NoEstimation = -1;
-  enum class SelectionPolicy {
-    BestFit,  // minimize difference between the free memory on the GPU and your
-              // budget
-    WorstFit, // maximize difference between the free memory on the GPU and your
-              // budget
-  };
-
-  // index of the first command line component after options
-  size_t break_point;
-
-  // number of GPUs to use
-  unsigned int gpu_count{1};
-
-  // slightly overly estimated memory budget per GPU
-  unsigned long long memory_estimation{NoEstimation};
-
-  // policy when selecting GPU
-  SelectionPolicy policy{SelectionPolicy::WorstFit};
-
-  // if we shall measure (elapsed) time of the program
-  bool timing{false};
-
-  // destination path to duplicate and store output from the program
-  std::string logging_path{};
-
-  // time interval between two samples on GPU memory consumption are taken
-  unsigned long long monitor_gpu_memory{0};
-
-  Configurations(const std::vector<std::string> &args) {
-    this->break_point = 1;
-    std::vector<Option> options;
-    options.emplace_back(
-        [this](parser_argument_iterator_t begin, parser_argument_iterator_t end) {
-          this->parse_gpu_count(begin, end);
-        },
-        "--gpus", 1
-    );
-    options.emplace_back(
-        [this](parser_argument_iterator_t begin, parser_argument_iterator_t end) {
-          this->parse_memory_estimation(begin, end);
-        },
-        "--memory-budget", 1
-    );
-    options.emplace_back(
-        [this](parser_argument_iterator_t begin, parser_argument_iterator_t end) {
-          this->parse_policy(begin, end);
-        },
-        "--policy", 1
-    );
-    options.emplace_back(
-        [](parser_argument_iterator_t begin, parser_argument_iterator_t end) {
-          Configurations::help(begin, end);
-        },
-        "--help", 0
-    );
-    options.emplace_back(
-        [this](parser_argument_iterator_t begin, parser_argument_iterator_t end) {
-          Configurations::true_saver(this->timing, begin, end);
-        },
-        "--time", 0
-    );
-    options.emplace_back(
-        [this](parser_argument_iterator_t begin, parser_argument_iterator_t end) {
-          this->parse_logging_path(begin, end);
-        },
-        "--log", 1
-    );
-    options.emplace_back(
-        [this](parser_argument_iterator_t begin, parser_argument_iterator_t end) {
-          this->parse_monitor_gpu_memory(begin, end);
-        },
-        "--watch-memory", 1
-    );
-
-    while (this->break_point < args.size() && args[this->break_point].substr(0, 2).compare("--") == 0) {
-      if (args[this->break_point].size() == 2) {
-        // it is just '--'
-        ++this->break_point;
-        break;
-      }
-      bool matched = false;
-      for (const auto &option : options) {
-        if (test_option(option, this->break_point, args)) {
-          matched = true;
-          break;
+#ifdef HAVE_SECRET_STORAGE
+    if (parse_result.contains("email-notify")) {
+      auto server_string = std::any_cast<std::string>(parse_result.at("email-notify"));
+      if (server_string.front() == '[') {
+        auto stop_point = server_string.find(']');
+        if (stop_point == server_string.npos) {
+          std::println(stderr, "invalid server string: unmatched '['");
+          exit(EXIT_FAILURE);
+        }
+        if (stop_point == server_string.size() - 1) {
+          this->email_server = server_string.substr(1, server_string.size() - 2);
+          this->email_port   = 465;
+        } else {
+          if (server_string.size() < stop_point + 3) {
+            std::println(stderr, "invalid server string: insufficient length of port number");
+            exit(EXIT_FAILURE);
+          }
+          if (server_string[stop_point + 1] != ':') {
+            std::println(stderr, "invalid server string: expected ':' before port number");
+            exit(EXIT_FAILURE);
+          }
+          this->email_port = Configurations::CommonParsers::full_convert_unsigned<uint16_t>(
+            server_string.substr(stop_point + 2)
+          );
+          this->email_server = server_string.substr(1, stop_point - 1);
+        }
+      } else {
+        if (server_string.find(':') != server_string.rfind(':')) {
+          std::println(
+            stderr, "invalid server string: more than one ':' detected, enclose IPv6 address with []"
+          );
+          exit(EXIT_FAILURE);
+        }
+        auto stop_point = server_string.find(':');
+        if (stop_point == server_string.npos) {
+          this->email_server = server_string;
+          this->email_port   = 465;
+        } else {
+          this->email_port = Configurations::CommonParsers::full_convert_unsigned<uint16_t>(
+            server_string.substr(stop_point + 1)
+          );
+          this->email_server = server_string.substr(0, stop_point);
         }
       }
-      if (!matched) {
-        fprintf(stderr, "unrecognized option %s\n", args[this->break_point].c_str());
-        exit(EXIT_FAILURE);
-      }
+    } else {
+      this->email_server = "";
+      this->email_port   = 0;
     }
-  }
+#endif
 
-  void dump(FILE *target) const {
-    fprintf(target, "========== configuration dump ==========\n");
-    fprintf(target, "  gpu_count: %u\n", this->gpu_count);
-    fprintf(target, "  memory_estimation: %llu\n", this->memory_estimation);
-    fprintf(target, "  policy: %s\n", this->policy == SelectionPolicy::BestFit ? "BestFit" : "WorstFit");
-    fprintf(target, "  timing: %s\n", this->timing ? "true" : "false");
-    fprintf(target, "  logging_path: %s\n", this->logging_path.c_str());
-    fprintf(target, "  monitor_gpu_memory: %llu\n", this->monitor_gpu_memory);
-    fprintf(target, "========== configuration dump ==========\n");
+    this->break_point = std::any_cast<size_t>(parse_result.at("_break_point"));
   }
-
-  [[nodiscard]] auto direct_exec() const -> bool { return !this->timing && this->monitor_gpu_memory == 0; }
+  void dump(FILE *file) const {
+    std::println(file, "------ options dump ------");
+    std::println(file, "background   : {}", this->background ? "true" : "false");
+    std::println(file, "break_point  : {}", this->break_point);
+#ifdef HAVE_SECRET_STORAGE
+    std::println(file, "email_server : {}", this->email_server);
+    std::println(file, "email_port   : {}", this->email_port);
+#endif
+    std::println(file, "gpu_count    : {}", this->gpu_count);
+    std::println(file, "logging_path : {}", this->logging_path);
+    std::println(file, "memory_budget: {}", this->memory_estimation);
+    std::println(file, "policy       : {}Fit", this->policy == SelectionPolicy::BestFit ? "Best" : "Worst");
+    std::println(file, "timing       : {}", this->timing ? "true" : "false");
+    std::println(file, "wait_timeout : {}", this->wait_memory_timeout);
+    std::println(file, "watch_memory : {}", this->monitor_gpu_memory);
+    std::println(file, "------ options dump ------");
+  }
 };
-static auto do_launch(char *argv[], const Configurations &config) -> int {
+class Parser : public Configurations {
+public:
+  Parser() {
+    this->add_option(
+      "--gpus",
+      [](parser_argument_iterator_t begin, parser_argument_iterator_t) -> std::any {
+        return CommonParsers::full_convert_unsigned<uint16_t>(*begin);
+      },
+      1
+    );
+    this->add_option("--memory-budget", CommonParsers::size_parser, 1);
+    this->add_option(
+      "--policy",
+      [](parser_argument_iterator_t begin, parser_argument_iterator_t) -> std::any {
+        if (*begin == "WorstFit") {
+          return Options::SelectionPolicy::WorstFit;
+        }
+        if (*begin == "BestFit") {
+          return Options::SelectionPolicy::BestFit;
+        }
+        std::println(stderr, "invalid option for --policy: {}", *begin);
+        exit(EXIT_FAILURE);
+      },
+      1
+    );
+    this->add_option("--time", CommonParsers::true_parser, 0);
+    this->add_option("--background", CommonParsers::true_parser, 0);
+    this->add_option("--log", CommonParsers::identity_parser, 1);
+    this->add_option("--watch-memory", CommonParsers::duration_parser, 1);
+    this->add_option("--wait-timeout", CommonParsers::duration_parser, 1);
+#ifdef HAVE_SECRET_STORAGE
+    this->add_option("--email-notify", CommonParsers::identity_parser, 1);
+#endif
+  }
+  void help() const override {
+    std::println("Launch computational process on proper GPUs regards to memory availability              ");
+    std::println("Usage: glaunch [OPTIONS...] [--] PROGRAM [ARGS...]                                      ");
+    std::println("OPTIONS:                                                                                ");
+    std::println("  --gpus COUNT               Use COUNT gpus for this program, defaults to 1             ");
+    std::println("                                                                                        ");
+    std::println("  --memory-budget SIZE       Slightly over-estimated size of memory your program will   ");
+    std::println("                              consume per GPU. Suffixes are allowed to simplify this    ");
+    std::println("                              configuration, try KiB, MiB, GiB, etc.. If you do not     ");
+    std::println("                              specify such value, we assume that your program could     ");
+    std::println("                              run with arbitrary amount of memory                       ");
+    std::println("                                                                                        ");
+    std::println("  --policy POLICY            Policy used to select GPU devices. Currently two policies  ");
+    std::println("                              are supported while we defaults to the first one:         ");
+    std::println("                               WorstFit: MAXIMIZE free space after your program launches");
+    std::println("                               BestFit: MINIMIZE free space after your program launches ");
+    std::println("                                                                                        ");
+    std::println("  --time                     When the program terminates, summary its elapsed time      ");
+    std::println("                                                                                        ");
+    std::println("  --background               Return after the process is launched, effectively run it   ");
+    std::println("                              in background. This will also remap file descriptors so   ");
+    std::println("                              that all output from the program will be discarded.       ");
+    std::println("                             A program launched in background mode will keep running    ");
+    std::println("                              even after you closed the terminal and logged out.        ");
+    std::println("                             See also --log.                                            ");
+    std::println("                                                                                        ");
+    std::println("  --log PATH                 Duplicate and save stdout and stderr to PATH               ");
+    std::println("                                                                                        ");
+    std::println("  --watch-memory DURATION    Dump GPU memory usage every DURATION seconds               ");
+    std::println("                              suffixes are supported, try m, h, d                       ");
+    std::println("                                                                                        ");
+    std::println("  --wait-timeout DURATION    Wait for no more than DURATION if no device have sufficient");
+    std::println("                              memory launching the specified process, -1 for infinity.  ");
+    std::println("                             Suffixes are supported.                                    ");
+    std::println("                                                                                        ");
+#ifdef HAVE_SECRET_STORAGE
+    std::println("  --email-notify SERVER      Notify about the termination of process launched via email ");
+    std::println("                              The address/domain name and port of SMTP server is given  ");
+    std::println("                               via SERVER string, which is <address/domain name>[:port] ");
+    std::println("                               the address/domain name is required and port is optional.");
+    std::println("                              If a IPv6 address is specified, enclose it with [] so that");
+    std::println("                               it will not be mistaken as port number.                  ");
+    std::println("                              If port number is omitted, we defaults to 465, the default");
+    std::println("                               port number of SMTP over TLS.                            ");
+    std::println("                              Attention: we do not check the address supplied but will  ");
+    std::println("                               pass it directly to the email sender.                    ");
+    std::println("                              Note that due to security consideration, we support only  ");
+    std::println("                               SMTP over TLS.                                           ");
+    std::println("                              Address and password is designed to be asked interactively");
+    std::println("                               to stop it from leaking from command line arguments which");
+    std::println("                               is usually visible to any other user on the same machine,");
+    std::println("                               and stored in a secret-storage server until the launched ");
+    std::println("                               process terminates, to a running secret-storage server is");
+    std::println("                               required for this to function correctly.                 ");
+    std::println("                              The notification will contain the arguments used to launch");
+    std::println("                               the process, its pid, exit status and following fields:  ");
+    std::println("                               if --time is specified, total wall-clock time it costs;  ");
+    std::println("                               if --log is specified, the logging file as an attachment.");
+    std::println("                                                                                        ");
+#endif
+    std::println("  --help                     Show this message again                                    ");
+    std::println("                                                                                        ");
+    std::println("                                                                                        ");
+    std::println("PROGRAM: the program to launch                                                          ");
+    std::println("ARGS: arguments passed to PROGRAM which will not be modified                            ");
+    std::println("                                                                                        ");
+    std::println("Notes:                                                                                  ");
+    std::println("  There are several options that sets up a DURATION which will be parsed as either a    ");
+    std::println("   timeout or an interval. Due to task scheduling and querying/calculating overheads,   ");
+    std::println("   do not expect them to be perfectly accurate: minor mistake will occur.               ");
+    std::println("  If you got some trouble on argument parsing, which may be triggered by a program      ");
+    std::println("   whose name starts with '--', you can add '--' before it to terminate option parsing  ");
+    std::println("   for example, glaunch --time -- --your-program                                        ");
+  }
+};
+// launch the actual process: this function will run in the
+// process which will, by this function, execvp(2)
+//  into the actual process
+// if we have forked off can be checked via !config.direct_exec()
+static auto do_launch(char *argv[], const Options &config) -> int {
   // set process group id to group processes forked from the actual computing process
   setpgid(0, 0);
+  if (!config.direct_exec()) { // arrange tasks that shall be done only if we are forking off here
+    // make this process get killed when the controlling glaunch process is
+    // killed note that this takes no effect if the program to be executed has
+    // set-user-id/set-group-id or
+    //  capabilities. If not sure, see prctl(2)
+    prctl(PR_SET_PDEATHSIG, SIGKILL);
+  }
+  // logging the command line to be executed
+  fprintf(stderr, "executing: [");
+  for (auto i = config.break_point; argv[i] != nullptr; i++) {
+    if (i != config.break_point) {
+      fprintf(stderr, ", ");
+    }
+    fputc('\'', stderr);
+    for (auto c = argv[i]; *c != '\0'; c++) {
+      if (*c == '\'') {
+        fprintf(stderr, R"('"'"')");
+      } else {
+        fputc(*c, stderr);
+      }
+    }
+    fputc('\'', stderr);
+  }
+  fprintf(stderr, "]...\n");
   execvp(argv[config.break_point], std::addressof(argv[config.break_point]));
   perror("failed to exec");
   return -ENOEXEC;
 }
-static void gpu_memory_watcher(
-    const pid_t pid, const std::vector<unsigned int> &device_ids, const Configurations &config
-) {
+static void
+gpu_memory_watcher(const pid_t pid, const std::vector<device_information> &devices, const Options &config) {
   while (true) {
     std::this_thread::sleep_for(std::chrono::seconds(config.monitor_gpu_memory));
     unsigned long long total_memory = 0;
-    for (const auto id : device_ids) {
-      nvmlDevice_t device = nullptr;
-      nvmlReturn_t return_value = nvmlDeviceGetHandleByIndex(id, &device);
-      if (return_value != NVML_SUCCESS) {
-        fprintf(stderr, "failed to open device %u: %s, skipping.\n", id, nvmlErrorString(return_value));
-        continue;
-      }
-      auto [status, processes] = get_processes_on_device(device);
-      if (status != NVML_SUCCESS) {
-        fprintf(
-            stderr, "failed to get processes on device %u: %s, skipping.\n", id, nvmlErrorString(return_value)
-        );
-        continue;
-      }
+    for (const auto &device : devices) {
+      auto processes = device.get_processes();
       for (const auto &process : processes) {
         if (getpgid(static_cast<pid_t>(process.pid)) == pid) {
           total_memory += process.usedGpuMemory;
         }
       }
     }
-    time_t current_time = time(nullptr);
+    time_t     current_time = time(nullptr);
     struct tm *current_tm;
     current_tm = localtime(&current_time);
-    char buffer[512];
-    strftime(buffer, sizeof(buffer), "[%EY %B %d %T]", current_tm);
-    fprintf(stderr, "%s %s GPU memory in use\n", buffer, get_readable_size(total_memory).c_str());
+    std::array<char, 512> buffer;
+    strftime(buffer.data(), buffer.size(), "[%EY %B %d %T]", current_tm);
+    std::println(stderr, "{} {} GPU memory in use", buffer.data(), get_readable_size(total_memory).c_str());
   }
 }
-auto main(int argc, char *argv[]) -> int {
-  fprintf(stdout, EXEC_NAME " " GLAUNCH_VERSION " licensed under AGPLv3 or later\n");
-  fprintf(stdout, "you can goto https://github.com/changhaoxuan23/gps for source code\n\n");
-  std::vector<std::string> args;
-  args.reserve(argc);
-  for (int i = 0; i < argc; i++) {
-    args.emplace_back(argv[i]);
+// get devices with sufficient memory, sort in decreasing order of free memory
+static auto get_available_devices(const Options &config, std::vector<device_information> &devices)
+  -> std::vector<device_information> {
+  std::ranges::for_each(devices, [](auto &device) { device.resample(); });
+  std::ranges::sort(devices, [](const device_information &lhs, const device_information &rhs) -> bool {
+    return lhs.memory.free > rhs.memory.free;
+  });
+  std::vector<device_information> result;
+  std::ranges::copy_if(
+    devices,
+    std::back_inserter(result),
+    [config](const device_information &device) -> bool {
+      return config.memory_estimation <= device.memory.free;
+    }
+  );
+  return result;
+}
+struct subprocess {
+  pid_t pid;
+  FILE *standard_input;
+};
+// launch a subprocess
+static auto launch_subprocess(const std::vector<std::string> &arguments) -> subprocess {
+  subprocess         result = {.pid = -1, .standard_input = nullptr};
+  std::array<int, 2> pipes;
+  if (pipe(pipes.data()) == -1) {
+    std::println(stderr, "failed to create pipe: {}", strerror(errno));
+    return result;
   }
-  Configurations config(args);
+  result.pid = fork();
+  if (result.pid == -1) {
+    std::println(stderr, "failed to fork: {}", strerror(errno));
+    return result;
+  }
+  if (result.pid == 0) {
+    close(pipes[1]);
+    fclose(stdin);
+    dup2(pipes[0], STDIN_FILENO);
+    stdin = fdopen(STDIN_FILENO, "r");
+    std::vector<const char *> translated_arguments;
+    translated_arguments.reserve(arguments.size() + 1);
+    std::ranges::transform(arguments, std::back_insert_iterator(translated_arguments), [](const auto &item) {
+      return item.c_str();
+    });
+    translated_arguments.emplace_back(nullptr);
+    execvp(translated_arguments[0], const_cast<char *const *>(translated_arguments.data()));
+    std::println(stderr, "failed to execve: {}", strerror(errno));
+  }
+  close(pipes[0]);
+  result.standard_input = fdopen(pipes[1], "w");
+  return result;
+}
+
+auto main(int argc, char *argv[]) -> int {
+  std::println("glaunch v0.0.3 licensed under AGPLv3 or later");
+  std::println("you can goto https://github.com/changhaoxuan23/gps for source code\n");
+
+  std::vector<std::string> args(argv, argv + argc);
+  Options                  config(Parser().parse(args));
   config.dump(stdout);
 
-  panic_on_failure(nvmlInit_v2);
-  unsigned int device_count = 0;
-  panic_on_failure(nvmlDeviceGetCount, &device_count);
-  if (device_count < config.gpu_count) {
-    fprintf(
-        stderr,
-        "requesting %u GPUs which is more than the number of GPUs (%u) on "
-        "this system\n",
-        config.gpu_count, device_count
-    );
-    return -ENOMEM;
-  }
-  std::vector<device_information> devices_;
-  devices_.reserve(device_count);
-  for (unsigned int i = 0; i < device_count; i++) {
-    nvmlDevice_t device = nullptr;
-    nvmlReturn_t return_value = nvmlDeviceGetHandleByIndex(i, &device);
-    if (return_value != NVML_SUCCESS) {
-      fprintf(stderr, "failed to open device %u: %s, skipping.\n", i, nvmlErrorString(return_value));
-      continue;
+#ifdef HAVE_SECRET_STORAGE
+  // deal with this at the very beginning since this requires active interaction with the user
+  std::string_view encoded_email_key;
+  std::string_view encoded_password_key;
+  if (config.email_port != 0) {
+    // make keys
+    auto email_key       = SecretStorageAccessor::make_secured_key(64);
+    encoded_email_key    = SecretStorageAccessor::encode_string(email_key);
+    auto password_key    = SecretStorageAccessor::make_secured_key(64);
+    encoded_password_key = SecretStorageAccessor::encode_string(password_key);
+    if (!SecretStorageAccessor::ensure_secret(email_key, "Email address")
+        || !SecretStorageAccessor::ensure_secret(password_key, "Email password")) {
+      std::println("failed to store secret, is the server running?");
+      return -EREMOTEIO;
     }
-    devices_.emplace_back(device);
-  }
-  std::sort(
-      devices_.begin(), devices_.end(),
-      [](const device_information &lhs, const device_information &rhs) -> bool {
-        return lhs.memory.free > rhs.memory.free;
-      }
-  );
-#ifndef NDEBUG
-  for (const auto &device : devices_) {
-    fprintf(
-        stderr, "%u (%s): %llu / %llu\n", device.id, device.name.c_str(), device.memory.free,
-        device.memory.total
-    );
+    SecretStorageAccessor::release_secured_string(email_key);
+    SecretStorageAccessor::release_secured_string(password_key);
   }
 #endif
-  std::vector<device_information> devices;
-  std::copy_if(
-      devices_.cbegin(), devices_.cend(), std::back_inserter(devices),
-      [config](const device_information &device) -> bool {
-        return config.memory_estimation == Configurations::NoEstimation
-                   ? true
-                   : config.memory_estimation < device.memory.free;
-      }
-  );
+
+  // get a list of devices
+  auto devices = NVMLSessionManager::get_manager().get_device_informations();
   if (devices.size() < config.gpu_count) {
-    fprintf(
-        stderr, "not enough devices with sufficient memory that satisfy "
-                "your request\n"
+    std::println(
+      stderr, "requesting {} devices but only {} available on this system", config.gpu_count, devices.size()
     );
     return -ENOMEM;
   }
+
+  std::vector<device_information> available_devices;
+  available_devices = get_available_devices(config, devices);
+  if (available_devices.size() < config.gpu_count) {
+    if (config.wait_memory_timeout == 0) {
+      std::println(stderr, "Insufficient device memory");
+      return -ENOMEM;
+    }
+    // wait for free memory
+    time_t                         start_wait_time = time(nullptr);
+    std::unordered_map<pid_t, int> registered_pids;
+    int                            epoll_fd = epoll_create1(0);
+    if (epoll_fd == -1) {
+      perror("failed to open epoll");
+      return -EIO;
+    }
+    while (true) {
+      // add newly launched processes into account
+      //  why they can launch but we cannot!? paruparu....
+      for (const auto &device : devices) {
+        auto processes = device.get_processes();
+        for (const auto &process : processes) {
+          if (!registered_pids.contains(static_cast<pid_t>(process.pid))) {
+            int pid_fd = static_cast<int>(syscall(SYS_pidfd_open, process.pid, 0));
+            registered_pids.insert({static_cast<pid_t>(process.pid), pid_fd});
+            epoll_event event = {
+              .events = EPOLLIN,
+              .data   = {.u64 = (static_cast<uint64_t>(process.pid) << 32) | static_cast<uint64_t>(pid_fd)}
+            };
+            epoll_ctl(epoll_fd, EPOLL_CTL_ADD, pid_fd, &event);
+          }
+        }
+      }
+
+      // wait by epoll
+      std::array<epoll_event, 8> events;
+      int                        timeout      = 0;
+      int                        current_time = static_cast<int>(time(nullptr));
+      if (config.wait_memory_timeout != 0 && current_time - start_wait_time < config.wait_memory_timeout) {
+        timeout = static_cast<int>(config.wait_memory_timeout - (current_time - start_wait_time)) * 1000;
+      } else if (config.wait_memory_timeout == 0) {
+        timeout = -1;
+      }
+      int n = epoll_wait(epoll_fd, events.data(), events.size(), timeout);
+      if (n == 0) {
+        std::println(stderr, "Timedout, insufficient memory.");
+        return -ENOMEM;
+      }
+      for (int i = 0; i < n; i++) {
+        auto pid = static_cast<pid_t>(events[i].data.u64 >> 32);
+        auto fd  = static_cast<int>(events[i].data.u64 & 0xffffffffu);
+        registered_pids.erase(pid);
+        close(fd);
+      }
+
+      // check if we have enough memory now
+      available_devices = get_available_devices(config, devices);
+      if (available_devices.size() >= config.gpu_count) {
+        for (const auto [pid, pid_fd] : registered_pids) {
+          close(pid_fd);
+        }
+        close(epoll_fd);
+      }
+    }
+  }
+
   std::string devices_to_use;
-  unsigned int count = 0;
-  size_t start = 0;
-  if (config.policy == Configurations::SelectionPolicy::BestFit) {
-    start = devices.size() - config.gpu_count;
-  } else if (config.policy == Configurations::SelectionPolicy::WorstFit) {
+  size_t      start = 0;
+  if (config.policy == Options::SelectionPolicy::BestFit) {
+    start = available_devices.size() - config.gpu_count;
+  } else if (config.policy == Options::SelectionPolicy::WorstFit) {
     start = 0;
   }
-  fprintf(stderr, "running on GPU: ");
-  std::vector<unsigned int> device_ids;
-  device_ids.reserve(config.gpu_count);
-  for (size_t i = start; count < config.gpu_count; i++, count++) {
+  std::vector<device_information> running_devices;
+  running_devices.reserve(config.gpu_count);
+  std::move(
+    std::next(available_devices.begin(), static_cast<long>(start)),
+    std::next(available_devices.begin(), static_cast<long>(start + config.gpu_count)),
+    std::back_insert_iterator(running_devices)
+  );
+  for (const auto &device : running_devices) {
     if (!devices_to_use.empty()) {
       devices_to_use += ',';
-      fprintf(stderr, ", ");
     }
-    devices_to_use += std::to_string(devices.at(i).id);
-    fprintf(stderr, "%u", devices.at(i).id);
-    device_ids.emplace_back(devices.at(i).id);
+    devices_to_use += std::to_string(device.id);
   }
-  fprintf(stderr, "\n");
+  std::println(stderr, "running on GPU: {}", devices_to_use);
+  if (config.background) {
+    pid_t pid = fork();
+    if (pid == -1) {
+      perror("failed to fork");
+      return -errno;
+    }
+    if (pid != 0) {
+      fprintf(stderr, "running in background with pid %d\n", pid);
+      return 0;
+    }
+    // remap file descriptors
+    int dev_null_fd = open("/dev/null", O_RDWR);
+    if (dev_null_fd == -1) {
+      perror("failed to open /dev/null");
+    }
+    fclose(stdin);
+    fclose(stdout);
+    fclose(stderr);
+    if (dev_null_fd != -1) {
+      dup2(dev_null_fd, STDIN_FILENO);
+      dup2(dev_null_fd, STDOUT_FILENO);
+      dup2(dev_null_fd, STDERR_FILENO);
+      close(dev_null_fd);
+      stderr = fdopen(STDERR_FILENO, "w");
+      stdout = fdopen(STDOUT_FILENO, "w");
+      setbuf(stderr, nullptr);
+      setbuf(stdout, nullptr);
+    }
+  }
   setenv("CUDA_VISIBLE_DEVICES", devices_to_use.c_str(), 1);
-  if (config.direct_exec()) {
-    return do_launch(argv, config);
-  }
   if (!config.logging_path.empty()) {
+    // setup logging first: we use tee to do this job, assuming which in
+    // installed on the system
+    //  since it is part of the GNU coreutils, it shall be safe to make such an
+    //  assumption in common cases
     int pipes[2];
-    pipe(pipes);
+    if (pipe(pipes) == -1) {
+      perror("failed to make pipe");
+      return -errno;
+    }
     pid_t pid = fork();
     if (pid == -1) {
       perror("cannot fork");
-      return errno;
+      return -errno;
     }
     if (pid == 0) {
       dup2(pipes[0], STDIN_FILENO);
       close(pipes[0]);
       close(pipes[1]);
-      execlp("tee", "tee", config.logging_path.c_str());
+      execlp("tee", "tee", config.logging_path.c_str(), nullptr);
+      // you shall not be here
       perror("cannot exec tee");
       exit(-errno);
     }
+    // close and reopen stdout/stderr on the pipe
     fclose(stdout);
     fclose(stderr);
     dup2(pipes[1], STDOUT_FILENO);
@@ -514,6 +582,9 @@ auto main(int argc, char *argv[]) -> int {
     stdout = fdopen(STDOUT_FILENO, "w");
     setbuf(stderr, nullptr);
     setbuf(stdout, nullptr);
+  }
+  if (config.direct_exec()) {
+    return do_launch(argv, config);
   }
   pid_t pid = fork();
   if (pid == -1) {
@@ -526,26 +597,99 @@ auto main(int argc, char *argv[]) -> int {
   timespec start_time;
   clock_gettime(CLOCK_MONOTONIC, &start_time);
   if (config.monitor_gpu_memory != 0) {
-    std::thread(gpu_memory_watcher, pid, std::ref(device_ids), std::ref(config)).detach();
+    std::thread(gpu_memory_watcher, pid, std::ref(running_devices), std::ref(config)).detach();
   }
   int status;
   waitpid(pid, std::addressof(status), 0);
+
+#ifdef HAVE_SECRET_STORAGE
+  subprocess email_sender = {.pid = -1, .standard_input = nullptr};
+  if (config.email_port != 0) {
+    std::vector<std::string> arguments = {
+      "send-email.py",
+      "--email-key",
+      std::string(encoded_email_key),
+      "--password-key",
+      std::string(encoded_password_key),
+      "--server-address",
+      config.email_server,
+      "--server-port",
+      std::to_string(config.email_port),
+      "--subject",
+      "Notification on task termination from glaunch",
+    };
+    if (!config.logging_path.empty()) {
+      arguments.emplace_back("--attachment");
+      arguments.emplace_back(config.logging_path);
+    }
+    email_sender = launch_subprocess(arguments);
+    SecretStorageAccessor::release_secured_string(encoded_email_key);
+    SecretStorageAccessor::release_secured_string(encoded_password_key);
+    if (email_sender.standard_input == nullptr) {
+      std::println(stderr, "failed to send email notification");
+    } else {
+      std::array<char, 100> hostname;
+      gethostname(hostname.data(), hostname.size());
+      std::println(
+        email_sender.standard_input, "The process launched by glaunch on {} has terminated.", hostname.data()
+      );
+      if (!config.logging_path.empty()) {
+        std::println(
+          email_sender.standard_input, "The log file has been attached as attachment.", hostname.data()
+        );
+      }
+      std::println(
+        email_sender.standard_input,
+        "The command line used to launch the process is {}.",
+        std::ranges::subrange(std::next(args.cbegin(), static_cast<long>(config.break_point)), args.cend())
+      );
+    }
+  }
+#endif
+
   int return_value = 0;
   if (WIFEXITED(status)) {
-    fprintf(stderr, "program exited with code %d\n", WEXITSTATUS(status));
+    std::println(stderr, "program exited with code {}", WEXITSTATUS(status));
+#ifdef HAVE_SECRET_STORAGE
+    if (email_sender.standard_input != nullptr) {
+      std::println(email_sender.standard_input, "program exited with code {}", WEXITSTATUS(status));
+    }
+#endif
     return_value = WEXITSTATUS(status);
   } else if (WIFSIGNALED(status)) {
-    fprintf(stderr, "program killed with signal %d\n", WTERMSIG(status));
+    std::println(stderr, "program killed with signal {}", WTERMSIG(status));
+#ifdef HAVE_SECRET_STORAGE
+    if (email_sender.standard_input != nullptr) {
+      std::println(email_sender.standard_input, "program killed with signal {}", WTERMSIG(status));
+    }
+#endif
     return_value = -EINTR;
   } else {
-    fprintf(stderr, "program terminated, but how?\n");
+    std::println(stderr, "program terminated, but how?");
+#ifdef HAVE_SECRET_STORAGE
+    if (email_sender.standard_input != nullptr) {
+      std::println(email_sender.standard_input, "program terminated, but how?");
+    }
+#endif
     return_value = -EAGAIN;
   }
   if (config.timing) {
     timespec current_time;
     clock_gettime(CLOCK_MONOTONIC, &current_time);
-    unsigned long long total_time = current_time.tv_sec - start_time.tv_sec;
-    fprintf(stderr, "elapsed time: %s\n", get_readable_duration(total_time).c_str());
+    unsigned long long total_time  = current_time.tv_sec - start_time.tv_sec;
+    const auto         time_string = get_readable_duration(total_time);
+    std::println(stderr, "elapsed time: {}", time_string);
+#ifdef HAVE_SECRET_STORAGE
+    if (email_sender.standard_input != nullptr) {
+      std::println(email_sender.standard_input, "The process took {} to finish its run.", time_string);
+    }
+#endif
   }
+#ifdef HAVE_SECRET_STORAGE
+  if (email_sender.standard_input != nullptr) {
+    fclose(email_sender.standard_input);
+    waitpid(email_sender.pid, nullptr, 0);
+  }
+#endif
   return return_value;
 }

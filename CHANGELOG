@@ -1,0 +1,19 @@
+v0.0.3
+[BUGFIX][glaunch] fixed an error that fails the memory usage monitor
+[BUGFIX][glaunch] fixed incorrect/mismatched option name in --background
+[FEATURE][glaunch] now user can request an email notification when the process terminates
+[CLEANUP][general] rearrange code
+[CLEANUP][general] use cmake as building system
+[CLEANUP][glaunch] use configurationspp to parse command line options
+
+v0.0.2
+[BUGFIX][glaunch] fixed unexpected file generation when used with --log option
+[BUGFIX][glaunch] fixed --log option takes no effect when used without --time and --watch-memory
+[ENHANCEMENT][glaunch] now child process launched by glaunch will be killed when glaunch terminates
+[ENHANCEMENT][glaunch] now glaunch will show the command line to be launched by default
+[FEATURE][general] rearrange build procedure with make/Makefile
+[FEATURE][general] W.I.P.: alter representation of device information
+[FEATURE][glaunch] options to wait for free memory
+[FEATURE][glaunch] options to run in background
+[CLEANUP][general] rearrange code
+[CLEANUP][gps] fix warning when compiling

@@ -17,127 +17,67 @@
 
 #ifndef NVML_COMMON_HH_
 #define NVML_COMMON_HH_
-#include <array>
-#include <cmath>
-#include <cstdio>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <nvml.h>
+#include <optional>
 #include <string>
-#include <utility>
 #include <vector>
-#define panic_on_failure(nvml_call, ...)                                                                     \
-  do {                                                                                                       \
-    nvmlReturn_t return_value = nvml_call(__VA_ARGS__);                                                      \
-    if (return_value != NVML_SUCCESS) {                                                                      \
-      fprintf(stderr, "error on " #nvml_call ": %s\n", nvmlErrorString(return_value));                       \
-      exit(EXIT_FAILURE);                                                                                    \
-    }                                                                                                        \
-  } while (false)
+
+// structure representing throughput measured by B/s
+struct throughput {
+  unsigned int receive;
+  unsigned int transmit;
+};
+
+// information of a device
+//  W.I.P, fields in this struct are subject to change
 struct device_information {
-  unsigned int id;     // index of the device
-  std::string name;    // name of the device
-  nvmlMemory_t memory; // memory statistics
+  // stable information, these information is not likely to change in a relative long period
+  nvmlDevice_t               handle;     // the handle of device
+  unsigned int               id;         // index of the device
+  std::string                name;       // name of the device
+  std::string                serial;     // board serial number of the device
+  nvmlPciInfo_t              pci;        // PCI bus information about the device
+  std::optional<std::string> uuid;       // uuid of the device, might unavailable
+  nvmlDeviceAttributes_t     attributes; // attributes of the device
+
+  // volatile information, these information may change rapidly
+
+  // time point at which volatile information is sampled
+  std::chrono::time_point<std::chrono::system_clock> sample_time;
+  throughput                                         pcie_throughput; // throughput of PCIe
+  nvmlMemory_t                                       memory;          // memory statistics
 
   // construct by directly query with the NVML library
-  device_information(nvmlDevice_t device) {
-    std::array<char, NVML_DEVICE_NAME_V2_BUFFER_SIZE> buffer;
-    nvmlReturn_t return_value;
-    return_value = nvmlDeviceGetIndex(device, std::addressof(this->id));
-    if (return_value != NVML_SUCCESS) {
-      fprintf(stderr, "failed to get device id: %s\n", nvmlErrorString(return_value));
-      this->id = -1;
-    }
-    return_value = nvmlDeviceGetName(device, buffer.data(), buffer.size());
-    if (return_value != NVML_SUCCESS) {
-      fprintf(stderr, "failed to get device name for %u: %s\n", this->id, nvmlErrorString(return_value));
-      buffer.at(0) = '\0';
-    }
-    this->name = buffer.data();
-    return_value = nvmlDeviceGetMemoryInfo(device, std::addressof(this->memory));
-    if (return_value != NVML_SUCCESS) {
-      fprintf(
-          stderr, "failed to get device memory statistics for %u: %s\n", this->id,
-          nvmlErrorString(return_value)
-      );
-      this->memory.free = NVML_VALUE_NOT_AVAILABLE;
-      this->memory.used = NVML_VALUE_NOT_AVAILABLE;
-      this->memory.total = NVML_VALUE_NOT_AVAILABLE;
-    }
-  }
+  device_information(nvmlDevice_t device);
+  // resample volatile information
+  void               resample();
+  // get computation processes on this device
+  [[nodiscard]] auto get_processes() const -> std::vector<nvmlProcessInfo_t>;
 };
-static auto get_processes_on_device(nvmlDevice_t device)
-    -> std::pair<nvmlReturn_t, std::vector<nvmlProcessInfo_t>> {
-  unsigned int process_count = 0;
-  nvmlProcessInfo_t *information = nullptr;
-  nvmlReturn_t return_value;
-  while (true) {
-    // since the number of process may change, we need to loop and keep increasing the size of buffer until
-    //  we can finally during some call to the API have sufficient space for all processes running
-    return_value = nvmlDeviceGetComputeRunningProcesses(device, &process_count, information);
-    if (return_value != NVML_ERROR_INSUFFICIENT_SIZE) {
-      if (return_value != NVML_SUCCESS) {
-        free(information);
-        information = nullptr;
-      }
-      break;
-    } else {
-      void *new_buffer = realloc(information, sizeof(nvmlProcessInfo_t) * process_count);
-      if (new_buffer == nullptr) {
-        free(information);
-        information = nullptr;
-        return_value = NVML_ERROR_INSUFFICIENT_SIZE;
-        break;
-      }
-      information = static_cast<nvmlProcessInfo_t *>(new_buffer);
-    }
-  }
-  if (information == nullptr) {
-    return std::make_pair(return_value, std::vector<nvmlProcessInfo_t>());
-  }
-  std::vector<nvmlProcessInfo_t> result(information, information + process_count);
-  return std::make_pair(NVML_SUCCESS, result);
-}
-static inline auto get_readable_duration(unsigned long long seconds) -> std::string {
-  const static std::array<std::string, 4> suffixes = {"day(s)", "hour(s)", "minute(s)", "second(s)"};
-  const static std::array<unsigned int, 4> ratios = {0, 24, 60, 60};
-  std::array<unsigned long long, 4> values;
-  values.back() = seconds;
-  for (size_t i = values.size() - 1; i != 0; i--) {
-    values.at(i - 1) = values.at(i) / ratios.at(i);
-    values.at(i) %= ratios.at(i);
-  }
-  bool start = false;
-  std::string result;
-  for (size_t i = 0; i < values.size(); i++) {
-    if (values.at(i) != 0) {
-      start = true;
-    }
-    if (start) {
-      result += std::to_string(values.at(i)) + " " + suffixes.at(i);
-      if (i != values.size() - 1) {
-        result += ", ";
-      }
-    }
-  }
-  if (!start) {
-    result = "0 second";
-  }
-  return result;
-}
-static inline auto get_readable_size(unsigned long long value) -> std::string {
-  std::array<std::string, 6> suffixes = {"B", "KiB", "MiB", "GiB", "TiB", "PiB"};
-  long double temporary = value;
-  unsigned int selection = 0;
-  while (selection < suffixes.size() - 1) {
-    if (temporary / 1024 > 1000) {
-      temporary /= 1024;
-      selection += 1;
-    } else {
-      break;
-    }
-  }
-  value = static_cast<unsigned long long>(std::round(temporary));
-  return std::to_string(value) + suffixes[selection];
-}
+
+class NVMLSessionManager {
+private:
+  NVMLSessionManager();
+  ~NVMLSessionManager();
+
+public:
+  static auto get_manager() -> NVMLSessionManager &;
+  // make a vector of device_information to all accessible devices on the system
+  auto        get_device_informations() -> std::vector<device_information>;
+};
+
+// get human-readable representation of duration given in unit of seconds
+//  due to ambiguity, no unit representing more seconds than day will be involved in the result, that is, only
+//  the following units may be employed:
+//    day    ---- 86400s
+//    hour   ----  3600s
+//    minute ----    60s
+//    second ----     1s
+auto get_readable_duration(unsigned long long seconds) -> std::string;
+
+// get human-readable representation of size given in unit of byte
+auto get_readable_size(unsigned long long value) -> std::string;
 #endif

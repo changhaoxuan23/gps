@@ -134,7 +134,9 @@ public:
           perror("cannot get memory information");
         } else {
           FILE *file = fdopen(statm_fd, "r");
-          fscanf(file, "%*u%llu", std::addressof(this->cpu_memory));
+          // as per linux interface, it is safe to make this assertion
+          auto parsed = fscanf(file, "%*u%llu", std::addressof(this->cpu_memory));
+          assert(parsed == 1);
           this->cpu_memory *= get_pagesize();
           fclose(file);
           statm_fd = -1;
@@ -215,11 +217,13 @@ public:
           FILE *file = fdopen(stat_fd, "r");
           unsigned long utime, stime;
           unsigned long long starttime;
-          fscanf(
+          // as per linux interface, it is safe to make this assertion
+          auto parsed = fscanf(
               file,
               "%*d %*s %*c %*d %*d %*d %*d %*d %*u %*u %*u %*u %*u %lu %lu %*d %*d %*d %*d %*d %*d %llu",
               std::addressof(utime), std::addressof(stime), std::addressof(starttime)
           );
+          assert(parsed == 3);
           this->timing.fill(utime, stime, starttime);
           fclose(file);
           stat_fd = -1;
