@@ -40,8 +40,3 @@ endif()
 install(TARGETS gps glaunch
   RUNTIME DESTINATION bin
 )
-
-
-
-add_executable(test test.cc)
-target_link_libraries(test PRIVATE nvml_common)
