@@ -492,6 +492,7 @@ auto main(int argc, char *argv[]) -> int {
           close(pid_fd);
         }
         close(epoll_fd);
+        break;
       }
     }
   }
