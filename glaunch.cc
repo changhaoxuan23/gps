@@ -607,6 +607,7 @@ auto main(int argc, char *argv[]) -> int {
   if (config.email_port != 0) {
     std::vector<std::string> arguments = {
       "send-email.py",
+      "--one-time-key",
       "--email-key",
       std::string(encoded_email_key),
       "--password-key",
