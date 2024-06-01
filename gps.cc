@@ -1,5 +1,5 @@
 // gps - list all compute processes running on gpu with detailed information
-// Copyright (C) 2023 Haoxuan Chang<changhaoxuan23@mails.ucas.ac.cn>
+// Copyright (C) 2023-2025 Haoxuan Chang<changhaoxuan23@mails.ucas.ac.cn>
 
 // This is part of gps.
 // This program is free software: you can redistribute it and/or modify
@@ -18,7 +18,6 @@
 #include <array>
 #include <cassert>
 #include <cerrno>
-#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -237,8 +236,8 @@ public:
   }
 };
 auto main() -> int {
-  fprintf(stdout, "gps v0.0.1 licensed under AGPLv3 or later\n");
-  fprintf(stdout, "you can goto https://github.com/changhaoxuan23/gps for source code\n\n");
+  std::println("gps in gps build v{}, licensed under AGPLv3 or later", GPS_VERSION);
+  std::println("you can goto https://github.com/changhaoxuan23/gps for source code\n");
   panic_on_failure(nvmlInit_v2);
   unsigned int device_count = 0;
   panic_on_failure(nvmlDeviceGetCount, &device_count);

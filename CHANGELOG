@@ -1,3 +1,10 @@
+v0.1.0
+[FEATURE][gtrace] introducing the new program in gps: gtrace, the tracer for GPU API calls
+[ENHANCEMENT][glaunch] now glaunch can work with interactive programs, say `glaunch python`
+[ENHANCEMENT][glaunch] glaunch is integrated with the tracer to provide more accurate memory accounting
+[CLEANUP][general] slightly modernize the CMake code
+[CLEANUP][glaunch] refactor the way to setup environment
+
 v0.0.3
 [BUGFIX][glaunch] fixed an error that fails the memory usage monitor
 [BUGFIX][glaunch] fixed incorrect/mismatched option name in --background

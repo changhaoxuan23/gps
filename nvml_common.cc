@@ -1,5 +1,5 @@
 // nvml_common.cc - commonly used utility functions interacting with NVML
-// Copyright (C) 2023 Haoxuan Chang<changhaoxuan23@mails.ucas.ac.cn>
+// Copyright (C) 2023-2025 Haoxuan Chang<changhaoxuan23@mails.ucas.ac.cn>
 
 // This is part of gps.
 // This program is free software: you can redistribute it and/or modify
@@ -18,43 +18,91 @@
 #include "nvml_common.hh"
 #include <array>
 #include <chrono>
+#include <cmath>
+#include <concepts>
 #include <memory>
 #include <nvml.h>
 #include <print>
+#include <source_location>
+#include <type_traits>
 // assert successful API call to NVML
 //  on failure, this macro shows the name of the failed call, shows a string explaining the error provided by
 //  NVML, and terminate the process with exit(EXIT_FAILURE)
 // parameters: the API function followed by all arguments to be passed to such API
-#define panic_on_failure(nvml_call, ...)                                                                     \
+#define panic_on_failure_call(nvml_call, ...)                                                                \
   do {                                                                                                       \
     nvmlReturn_t return_value = nvml_call(__VA_ARGS__);                                                      \
     if (return_value != NVML_SUCCESS) {                                                                      \
-      fprintf(stderr, "error on " #nvml_call ": %s\n", nvmlErrorString(return_value));                       \
-      exit(EXIT_FAILURE);                                                                                    \
+      std::println(stderr, "error on " #nvml_call ": {}\n", nvmlErrorString(return_value));                  \
+      ::exit(EXIT_FAILURE);                                                                                  \
     }                                                                                                        \
   } while (false)
 
-NVMLSessionManager::NVMLSessionManager() { panic_on_failure(nvmlInit); }
+static inline void initialize_nvml() { panic_on_failure_call(nvmlInit); }
+
+static inline void
+panic_on_failure(nvmlReturn_t value, const std::source_location location = std::source_location::current()) {
+  if (value != NVML_SUCCESS) {
+    std::println(
+      stderr,
+      "successful call asserted but failed at [{}:{}] {}",
+      location.file_name(),
+      location.line(),
+      location.function_name()
+    );
+    ::exit(EXIT_FAILURE);
+  }
+}
+
+class ReinitializeHelper {
+public:
+  static void rebuild_internal_struct(NVMLSessionManager &manager) { manager.rebuild_underlying_structure(); }
+};
+
+// this function will automatically initialize NVML and rerun the call if not initialized
+//  to minimize overhead, this is required only once by the first API call in each method
+template <typename... Args>
+static inline auto initialize_guard(std::invocable<Args &&...> auto function, Args &&...args)
+  -> std::enable_if<
+    std::is_same<typename std::invoke_result<decltype(function), Args &&...>::type, nvmlReturn_t>::value,
+    nvmlReturn_t>::type {
+  auto return_value = function(std::forward<Args>(args)...);
+  if (return_value == NVML_ERROR_UNINITIALIZED) {
+    initialize_nvml();
+    ReinitializeHelper::rebuild_internal_struct(NVMLSessionManager::get_manager());
+    return_value = function(std::forward<Args>(args)...);
+  }
+  return return_value;
+}
+
+NVMLSessionManager::NVMLSessionManager() { initialize_nvml(); }
 NVMLSessionManager::~NVMLSessionManager() { nvmlShutdown(); }
+void NVMLSessionManager::rebuild_underlying_structure() {
+  for (auto &device : this->devices) {
+    panic_on_failure_call(nvmlDeviceGetHandleByIndex, device.id, &device.handle);
+  }
+}
 auto NVMLSessionManager::get_manager() -> NVMLSessionManager & {
   static NVMLSessionManager manager;
   return manager;
 }
-auto NVMLSessionManager::get_device_informations() -> std::vector<device_information> {
-  unsigned int device_count = 0;
-  panic_on_failure(nvmlDeviceGetCount, &device_count);
-  std::vector<device_information> devices;
-  devices.reserve(device_count);
-  for (unsigned int i = 0; i < device_count; i++) {
-    nvmlDevice_t device       = nullptr;
-    nvmlReturn_t return_value = nvmlDeviceGetHandleByIndex(i, &device);
-    if (return_value != NVML_SUCCESS) {
-      fprintf(stderr, "failed to open device %u: %s, skipping.\n", i, nvmlErrorString(return_value));
-      continue;
+auto NVMLSessionManager::get_device_informations() -> std::vector<device_information> & {
+  if (!devices_initialized) {
+    unsigned int device_count = 0;
+    panic_on_failure(initialize_guard(nvmlDeviceGetCount, &device_count));
+    this->devices.reserve(device_count);
+    for (unsigned int i = 0; i < device_count; i++) {
+      nvmlDevice_t device       = nullptr;
+      nvmlReturn_t return_value = nvmlDeviceGetHandleByIndex(i, &device);
+      if (return_value != NVML_SUCCESS) {
+        fprintf(stderr, "failed to open device %u: %s, skipping.\n", i, nvmlErrorString(return_value));
+        continue;
+      }
+      this->devices.emplace_back(device);
     }
-    devices.emplace_back(device);
+    devices_initialized = true;
   }
-  return devices;
+  return this->devices;
 }
 
 device_information::device_information(nvmlDevice_t device) : handle(device) {
@@ -77,8 +125,9 @@ device_information::device_information(nvmlDevice_t device) : handle(device) {
 void device_information::resample() {
   this->sample_time = std::chrono::system_clock::now();
   nvmlReturn_t return_value;
-  return_value =
-    nvmlDeviceGetPcieThroughput(this->handle, NVML_PCIE_UTIL_TX_BYTES, &this->pcie_throughput.transmit);
+  return_value = initialize_guard(
+    nvmlDeviceGetPcieThroughput, this->handle, NVML_PCIE_UTIL_TX_BYTES, &this->pcie_throughput.transmit
+  );
   if (return_value != NVML_SUCCESS) {
     std::println(
       stderr, "failed to get device throughput for {}: {}", this->id, nvmlErrorString(return_value)
@@ -108,14 +157,26 @@ auto device_information::get_processes() const -> std::vector<nvmlProcessInfo_t>
   unsigned int                         process_count = 0;
   std::unique_ptr<nvmlProcessInfo_t[]> information;
   nvmlReturn_t                         return_value;
+  bool                                 first = true;
   while (true) {
     // since the number of process may change, we need to loop and keep
     // increasing the size of buffer until
     //  we can finally during some call to the API have sufficient space for all
     //  processes running
-    return_value = nvmlDeviceGetComputeRunningProcesses(this->handle, &process_count, information.get());
+
+    if (first) {
+      return_value = initialize_guard(
+        nvmlDeviceGetComputeRunningProcesses, this->handle, &process_count, information.get()
+      );
+      first = false;
+    } else {
+      return_value = nvmlDeviceGetComputeRunningProcesses(this->handle, &process_count, information.get());
+    }
     if (return_value != NVML_ERROR_INSUFFICIENT_SIZE) {
       if (return_value != NVML_SUCCESS) {
+        std::println(
+          stderr, "failed to get processes on device {}: {}", this->id, nvmlErrorString(return_value)
+        );
         information.reset();
       }
       break;
@@ -169,6 +230,6 @@ auto get_readable_size(unsigned long long value) -> std::string {
       break;
     }
   }
-  value = static_cast<unsigned long long>(std::round(temporary));
+  value = static_cast<unsigned long long>(::round(temporary));
   return std::to_string(value) + suffixes[selection];
 }

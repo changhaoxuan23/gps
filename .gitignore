@@ -1,4 +1,3 @@
-nvml.h
-pack.sh
-.cache/
-build/
+/.cache/
+/build/
+/install/

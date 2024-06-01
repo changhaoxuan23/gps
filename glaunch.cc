@@ -1,6 +1,5 @@
 // glaunch - Launch computational process on proper GPUs regards to memory
-// availability Copyright (C) 2023-2024 Haoxuan
-// Chang<changhaoxuan23@mails.ucas.ac.cn>
+// availability Copyright (C) 2023-2025 Haoxuan Chang<changhaoxuan23@mails.ucas.ac.cn>
 
 // This is part of gps.
 // This program is free software: you can redistribute it and/or modify
@@ -16,21 +15,26 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-#include "nvml_common.hh"
+#include <configuration.hh>
+#include <hooked_api_config.hh>
+#include <nvml_common.hh>
+
 #include <algorithm>
 #include <array>
 #include <cassert>
 #include <cctype>
 #include <chrono>
-#include <configuration.hh>
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <ctime>
 #include <fcntl.h>
-#include <functional>
+#include <filesystem>
 #include <print>
+#include <span>
 #include <string>
+#include <string_view>
 #include <sys/epoll.h>
 #include <sys/prctl.h>
 #include <sys/syscall.h>
@@ -38,30 +42,128 @@
 #include <thread>
 #include <unistd.h>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 #ifdef HAVE_SECRET_STORAGE
 #include <secret_storage_accessor.hh>
 #endif
 
+struct MemoryMonitoringMethod {
+public:
+  using value_type = uint16_t;
+  enum : value_type {
+    NONE  = 0x0000,
+    NVML  = 0x0001,
+    Trace = 0x0002,
+    ALL   = 0xffff,
+  };
+  using enum_type = decltype(MemoryMonitoringMethod::NONE);
+
+  // interval between two queries using the NVML library
+  //  this is only effective if NVML is set while Trace is not
+  uint32_t nvml_query_interval;
+
+  MemoryMonitoringMethod() = default;
+  explicit MemoryMonitoringMethod(enum_type value) : value(value) {}
+  auto operator=(enum_type rhs) -> MemoryMonitoringMethod & {
+    this->value = rhs;
+    return *this;
+  }
+  operator bool() const { return this->value != MemoryMonitoringMethod::NONE; }
+  auto operator|(enum_type rhs) const -> MemoryMonitoringMethod {
+    return MemoryMonitoringMethod(static_cast<enum_type>(this->value | rhs));
+  }
+  auto operator|(const MemoryMonitoringMethod &rhs) const -> MemoryMonitoringMethod {
+    return this->operator|(rhs.value);
+  }
+  auto operator&(enum_type rhs) const -> MemoryMonitoringMethod {
+    return MemoryMonitoringMethod(static_cast<enum_type>(this->value & rhs));
+  }
+  auto operator&(const MemoryMonitoringMethod &rhs) const -> MemoryMonitoringMethod {
+    return this->operator&(rhs.value);
+  }
+  auto operator~() const -> MemoryMonitoringMethod {
+    return MemoryMonitoringMethod(static_cast<enum_type>(MemoryMonitoringMethod::ALL - this->value));
+  }
+  auto operator|=(enum_type rhs) -> MemoryMonitoringMethod & {
+    this->value = static_cast<enum_type>(this->value | rhs);
+    return *this;
+  }
+  auto operator|=(const MemoryMonitoringMethod &rhs) -> MemoryMonitoringMethod & {
+    return this->operator|=(rhs.value);
+  }
+  auto operator&=(enum_type rhs) -> MemoryMonitoringMethod & {
+    this->value = static_cast<enum_type>(this->value & rhs);
+    return *this;
+  }
+  auto operator&=(const MemoryMonitoringMethod &rhs) -> MemoryMonitoringMethod & {
+    return this->operator&=(rhs.value);
+  }
+
+private:
+  enum_type value{MemoryMonitoringMethod::NONE};
+};
+template <> struct std::formatter<MemoryMonitoringMethod> {
+  constexpr auto parse(std::format_parse_context &ctx) { return ctx.begin(); }
+  template <std::output_iterator<char> Iter>
+  auto format(const MemoryMonitoringMethod &v, std::basic_format_context<Iter, char> &ctx) const {
+    constexpr auto keys  = std::to_array<std::pair<const char *, MemoryMonitoringMethod::enum_type>>({
+      {"nvml", MemoryMonitoringMethod::NVML},
+      {"trace", MemoryMonitoringMethod::Trace},
+    });
+    auto         &&out   = ctx.out();
+    bool           first = true;
+    for (const auto [name, value] : keys) {
+      if (!(v & value)) {
+        continue;
+      }
+      if (first) {
+        first = false;
+      } else {
+        std::format_to(out, " | ");
+      }
+      std::format_to(out, "{}", name);
+    }
+    if (first) {
+      std::format_to(out, "NONE");
+    }
+    return out;
+  }
+};
+
 struct Options {
   enum class SelectionPolicy { BestFit, WorstFit };
-  bool            background;
+
+  // the program to be launched shall be started in background
+  //  to be specific, it shall be forked and detached from the current controlling shell with output closed
+  bool background;
+
+  // the program launched shall be timed
   bool            timing;
   uint16_t        gpu_count;
   SelectionPolicy policy;
   uint32_t        wait_memory_timeout;
   std::string     logging_path;
   size_t          break_point;
-  uint64_t        monitor_gpu_memory;
-  size_t          memory_estimation;
+
+  // the method to watch gpu memory usage
+  MemoryMonitoringMethod monitor_gpu_memory;
+  size_t                 memory_estimation;
 #ifdef HAVE_SECRET_STORAGE
   std::string email_server;
   uint16_t    email_port;
 #endif
+
+  // check if we should execute the program to start directly without forking first
+  //  if a direct exec is done, we will not have our process alongside with the program
+  //  launched and will have limited capabilities.
   [[nodiscard]] auto direct_exec() const -> bool {
-    return !this->timing && this->monitor_gpu_memory == 0
+    return !this->timing // we need to record and report the timepoint the program is launched and the
+                         // timepoint which terminates if we are doing timing
+        && !this->monitor_gpu_memory // we need to query with NVML or process traced API calls to
+                                     // monitor GPU memory usage
 #ifdef HAVE_SECRET_STORAGE
-        && this->email_port == 0
+        && this->email_port == 0 // we need to send email after the program launched terminates
 #endif
       ;
   };
@@ -95,9 +197,38 @@ struct Options {
     }
 
     if (parse_result.contains("watch-memory")) {
-      this->monitor_gpu_memory = std::any_cast<unsigned long long>(parse_result.at("watch-memory"));
+      const auto      &list_ = std::any_cast<std::string>(parse_result.at("watch-memory"));
+      std::string_view list{list_};
+      size_t           start = 0;
+      while (true) {
+        auto end   = list.find_first_of(',', start);
+        auto entry = list.substr(start, end - start);
+        if (entry == "all") {
+          this->monitor_gpu_memory = MemoryMonitoringMethod::ALL;
+        } else if (entry.starts_with("nvml")) {
+          this->monitor_gpu_memory |= MemoryMonitoringMethod::NVML;
+          if (entry.size() > 5 && entry[4] == ':') {
+            std::string               temporary{entry.substr(5)};
+            std::span<std::string, 1> helper{&temporary, 1};
+            this->monitor_gpu_memory.nvml_query_interval = std::any_cast<unsigned long long>(
+              Configurations::CommonParsers::duration_parser(helper.begin(), helper.end())
+            );
+          } else {
+            this->monitor_gpu_memory.nvml_query_interval = 5;
+          }
+        } else if (entry == "trace") {
+          this->monitor_gpu_memory |= MemoryMonitoringMethod::Trace;
+        } else {
+          std::println(stderr, "invalid type supplied to watch-memory: `{}'", entry);
+          ::exit(EXIT_FAILURE);
+        }
+        if (end == entry.npos) {
+          break;
+        }
+        start = end + 1;
+      }
     } else {
-      this->monitor_gpu_memory = 0;
+      this->monitor_gpu_memory = MemoryMonitoringMethod::NONE;
     }
 
     if (parse_result.contains("wait-timeout")) {
@@ -204,7 +335,7 @@ public:
     this->add_option("--time", CommonParsers::true_parser, 0);
     this->add_option("--background", CommonParsers::true_parser, 0);
     this->add_option("--log", CommonParsers::identity_parser, 1);
-    this->add_option("--watch-memory", CommonParsers::duration_parser, 1);
+    this->add_option("--watch-memory", CommonParsers::identity_parser, 1);
     this->add_option("--wait-timeout", CommonParsers::duration_parser, 1);
 #ifdef HAVE_SECRET_STORAGE
     this->add_option("--email-notify", CommonParsers::identity_parser, 1);
@@ -238,8 +369,32 @@ public:
     std::println("                                                                                        ");
     std::println("  --log PATH                 Duplicate and save stdout and stderr to PATH               ");
     std::println("                                                                                        ");
-    std::println("  --watch-memory DURATION    Dump GPU memory usage every DURATION seconds               ");
-    std::println("                              suffixes are supported, try m, h, d                       ");
+    std::println("  --watch-memory TYPE        Dump GPU memory usage. TYPE should be a list separated by  ");
+    std::println("                              comma to instruct how GPU memory usage shall be measured. ");
+    std::println("                              No space shall be included in the list.                   ");
+    std::println("                              Possible values are:                                      ");
+    std::println("                               nvml: measure with NVML, the NVIDIA management library.  ");
+    std::println("                                     this shall report identical value as nvidia-smi.   ");
+    std::println("                                     If this option is supplied together with trace, the");
+    std::println("                                     GPU memory usage will be measured whenever an event");
+    std::println("                                     is reported in the trace. Otherwise it will be done");
+    std::println("                                     by polling, in which case the interval defaults to ");
+    std::println("                                     5 seconds while may be configured by suffixing this");
+    std::println("                                     key with a colon and the DURATION specification.   ");
+    std::println("                                     Example:                                           ");
+    std::println("                                      nvml:1m will cause the memory usage being measured");
+    std::println("                                       and reported every one minute.                   ");
+    std::println("                               trace: measure by tracing all CUDA runtime APIs.         ");
+    std::println("                                      this will record all call to CUDA runtime API that");
+    std::println("                                       allocates or frees memory on device, providing an");
+    std::println("                                       accurate measurement on size of memory requested ");
+    std::println("                                       by the program while excluding any overhead.     ");
+    std::println("                                      note that therefore, memory usage measured can be ");
+    std::println("                                       smaller than the one reported by nvml, and such  ");
+    std::println("                                       difference can be more significant if the memory ");
+    std::println("                                       memory watermark is high, i.e. the process asked ");
+    std::println("                                       for only a small amount of memory.               ");
+    std::println("                               all: measure by every possible method and report them all");
     std::println("                                                                                        ");
     std::println("  --wait-timeout DURATION    Wait for no more than DURATION if no device have sufficient");
     std::println("                              memory launching the specified process, -1 for infinity.  ");
@@ -285,6 +440,293 @@ public:
     std::println("   for example, glaunch --time -- --your-program                                        ");
   }
 };
+
+class EnvironmentArranger {
+public:
+  EnvironmentArranger()          = default;
+  virtual ~EnvironmentArranger() = default;
+  virtual void before_fork()     = 0;
+  void         after_fork(pid_t pid) {
+    if (pid == 0) {
+      this->arrange_children();
+    } else {
+      this->arrange_parent(pid);
+    }
+  }
+
+protected:
+  virtual void arrange_children()        = 0;
+  virtual void arrange_parent(pid_t pid) = 0;
+};
+
+class LogEnvironmentArranger : public EnvironmentArranger {
+  // setup logging: we use tee to do this job, assuming which is installed on the system
+  //  since it is part of the GNU coreutils, it shall be safe to make such assumption in common cases
+private:
+  int                         pipes[2];
+  const std::filesystem::path destination;
+
+protected:
+  void arrange_children() override {
+    // close and reopen stdout/stderr on the pipe
+    if (this->pipes[1] != -1) {
+      dup2(this->pipes[1], STDOUT_FILENO);
+      dup2(this->pipes[1], STDERR_FILENO);
+      close(pipes[1]);
+    }
+  }
+  void arrange_parent(pid_t) override {
+    if (this->pipes[1] != -1) {
+      close(this->pipes[1]);
+    }
+  }
+
+public:
+  LogEnvironmentArranger(std::filesystem::path destination) : destination(std::move(destination)) {}
+  void before_fork() override {
+    if (pipe(this->pipes) == -1) {
+      perror("failed to make pipe for logging");
+      exit(EXIT_FAILURE);
+    }
+    pid_t pid = fork();
+    if (pid == -1) {
+      perror("cannot fork to launch tee");
+      close(this->pipes[0]);
+      close(this->pipes[1]);
+      this->pipes[0] = -1;
+      this->pipes[1] = -1;
+      return;
+    }
+
+    if (pid == 0) {
+      dup2(this->pipes[0], STDIN_FILENO);
+      close_range(3, ~0U, CLOSE_RANGE_UNSHARE);
+      execlp("tee", "tee", this->destination.c_str(), nullptr);
+      // you shall not be here
+      perror("cannot exec tee");
+    }
+    close(this->pipes[0]);
+  }
+};
+
+class MemoryWatcherEnvironmentArranger : public EnvironmentArranger {
+private:
+  int                             pipes[2];
+  MemoryMonitoringMethod          method;
+  std::vector<device_information> running_devices;
+  pid_t                           pid;
+
+  struct parsed_trace_line {
+    std::string_view api_name;
+    std::string_view arguments;
+    bool             succeed;
+
+    parsed_trace_line(std::string_view line) {
+      auto name_split     = line.find_first_of('(');
+      this->api_name      = line.substr(0, name_split);
+      auto argument_split = line.find(") -> ");
+      this->arguments     = line.substr(name_split + 1, argument_split - name_split - 1);
+      this->succeed       = line[argument_split + 5] == '0';
+    }
+  };
+
+  static auto get_time() -> std::string {
+    time_t     current_time = time(nullptr);
+    struct tm *current_tm;
+    current_tm = localtime(&current_time);
+    std::array<char, 512> buffer;
+    strftime(buffer.data(), buffer.size(), "[%EY %B %d %T]", current_tm);
+    return {buffer.data()};
+  }
+
+  void nvml_memory_watcher() {
+    unsigned long long total_memory = 0;
+    for (const auto &device : this->running_devices) {
+      auto processes = device.get_processes();
+      for (const auto &process : processes) {
+        if (getpgid(static_cast<pid_t>(process.pid)) == this->pid) {
+          total_memory += process.usedGpuMemory;
+        }
+      }
+    }
+    std::println(
+      stderr, "[watch-memory:nvml]{} {} GPU memory in use", this->get_time(), get_readable_size(total_memory)
+    );
+  }
+
+  void trace_memory_watcher() {
+    FILE                                 *input = fdopen(this->pipes[0], "r");
+    std::array<char, 512>                 buffer;
+    std::unordered_map<uintmax_t, size_t> memory_blocks;
+    size_t                                allocated_size   = 0;
+    bool                                  warn_array_calls = true;
+    bool                                  warn_async_calls = true;
+
+    while (true) {
+      buffer[0] = '\0';
+      fgets(buffer.data(), buffer.size(), input);
+      std::string_view line{buffer.data()};
+      if (line.empty()) {
+        break;
+      }
+      line = line.substr(0, line.size() - 1);
+      parsed_trace_line trace(line);
+      if (!trace.succeed) {
+        continue;
+      }
+      if (trace.api_name == "cudaFreeHost") {
+        continue;
+      }
+
+      if (this->method & MemoryMonitoringMethod::NVML) {
+        this->nvml_memory_watcher();
+      }
+
+      if (trace.api_name.contains("Array")) {
+        if (warn_array_calls) {
+          warn_array_calls = false;
+          std::println(
+            stderr,
+            "[watch-memory:trace]{} Program is using Array-based API(s) which is not yet supported, memory "
+            "accounting will be inaccurate.",
+            this->get_time()
+          );
+        }
+        std::println(stderr, "[watch-memory:trace]{} Unsupported call: {}", this->get_time(), line);
+        continue;
+      }
+
+      if (trace.api_name.contains("Async")) {
+        if (warn_async_calls) {
+          warn_async_calls = false;
+          std::println(
+            stderr,
+            "[watch-memory:trace]{} Program is using async memory allocation API(s) whose failure may be "
+            "reported by later API calls instead of the call itself, which is not captured. All async "
+            "allocation are treated according to only the direct return value, therefore memory accounting "
+            "can be inaccurate if the allocation actually failed but such failure is reported afterwards.",
+            this->get_time()
+          );
+        }
+        std::println(stderr, "[watch-memory:trace]{} Async call: {}", this->get_time(), line);
+      }
+
+      if (trace.api_name == "cudaFree" || trace.api_name == "cudaFreeAsync") {
+        auto target =
+          strtoull(trace.arguments.substr(trace.arguments.find("devPtr=[") + 8).data(), nullptr, 16);
+        auto iter = memory_blocks.find(target);
+        if (iter == memory_blocks.end()) {
+          std::println(
+            stderr,
+            "[watch-memory:trace]{} program freeing an unrecognized address, this is likely caused by an "
+            "unrecorded allocation\n"
+            "  The call was {}",
+            this->get_time(),
+            line
+          );
+          continue;
+        }
+        allocated_size -= iter->second;
+        std::println(
+          stderr,
+          "[watch-memory:trace]{} freed {}, {} active",
+          this->get_time(),
+          get_readable_size(iter->second),
+          get_readable_size(allocated_size)
+        );
+        memory_blocks.erase(iter);
+      } else {
+        uintmax_t target = 0;
+        size_t    size   = 0;
+        if (trace.api_name == "cudaMallocFromPoolAsync") {
+          target = strtoull(trace.arguments.substr(trace.arguments.find("ptr=[") + 5).data(), nullptr, 16);
+          size   = strtoull(trace.arguments.substr(trace.arguments.find("size=") + 5).data(), nullptr, 10);
+        } else if (trace.api_name == "cudaMalloc" || trace.api_name == "cudaMallocManaged"
+                   || trace.api_name == "cudaMallocAsync") {
+          target = strtoull(trace.arguments.substr(trace.arguments.find("devPtr=[") + 8).data(), nullptr, 16);
+          size   = strtoull(trace.arguments.substr(trace.arguments.find("size=") + 5).data(), nullptr, 10);
+        } else if (trace.api_name == "cudaMalloc3D") {
+          target = strtoull(trace.arguments.substr(trace.arguments.find("ptr=[") + 5).data(), nullptr, 16);
+          auto width =
+            strtoull(trace.arguments.substr(trace.arguments.find("pitch=") + 6).data(), nullptr, 10);
+          auto depth =
+            strtoull(trace.arguments.substr(trace.arguments.find("depth=") + 6).data(), nullptr, 10);
+          auto height =
+            strtoull(trace.arguments.substr(trace.arguments.find("height=") + 7).data(), nullptr, 10);
+          size = width * depth * height;
+        } else if (trace.api_name == "cudaMallocPitch") {
+          target = strtoull(trace.arguments.substr(trace.arguments.find("devPtr=[") + 8).data(), nullptr, 16);
+          auto width =
+            strtoull(trace.arguments.substr(trace.arguments.find("pitch=[") + 7).data(), nullptr, 10);
+          auto height =
+            strtoull(trace.arguments.substr(trace.arguments.find("height=") + 7).data(), nullptr, 10);
+          size = width * height;
+        } else {
+          std::println(
+            stderr,
+            "[watch-memory:trace]{} Unexpected API call reported, see the following line for detail.\n  {}",
+            this->get_time(),
+            line
+          );
+        }
+
+        memory_blocks.emplace(target, size);
+        allocated_size += size;
+        std::println(
+          stderr,
+          "[watch-memory:trace{} allocated {}, {} active",
+          this->get_time(),
+          get_readable_size(size),
+          get_readable_size(allocated_size)
+        );
+      }
+    }
+  }
+
+public:
+  MemoryWatcherEnvironmentArranger(MemoryMonitoringMethod method, std::vector<device_information> &&devices)
+    : method(method), running_devices(devices) {
+    this->pipes[0] = -1;
+    this->pipes[1] = -1;
+    this->pid      = -1;
+  }
+  void before_fork() override {
+    if (this->method & MemoryMonitoringMethod::Trace) {
+      if (pipe(this->pipes) == -1) {
+        perror("failed to make pipe for hooked api report");
+        exit(EXIT_FAILURE);
+      }
+      GPSHookedAPIConfiguration config;
+      auto                     &sink = config.outputs.emplace_back();
+      sink.output_fd                 = this->pipes[1];
+      sink.include_backtrace         = false;
+      sink.filter                    = "(cudaFree|cudaMalloc).*";
+      setup_api_hook(std::move(config));
+    }
+  }
+
+protected:
+  void arrange_children() override {
+    if (this->pipes[0] != -1) {
+      close(this->pipes[0]);
+    }
+  }
+  void arrange_parent(pid_t pid) override {
+    this->pid = pid;
+    if (this->method & MemoryMonitoringMethod::Trace) {
+      close(this->pipes[1]);
+      std::thread([this]() { this->trace_memory_watcher(); }).detach();
+    } else if (this->method & MemoryMonitoringMethod::NVML) {
+      std::thread([this]() {
+        while (true) {
+          std::this_thread::sleep_for(std::chrono::seconds(this->method.nvml_query_interval));
+          this->nvml_memory_watcher();
+        }
+      }).detach();
+    }
+  }
+};
+
 // launch the actual process: this function will run in the
 // process which will, by this function, execvp(2)
 //  into the actual process
@@ -320,27 +762,6 @@ static auto do_launch(char *argv[], const Options &config) -> int {
   perror("failed to exec");
   return -ENOEXEC;
 }
-static void
-gpu_memory_watcher(const pid_t pid, const std::vector<device_information> &devices, const Options &config) {
-  while (true) {
-    std::this_thread::sleep_for(std::chrono::seconds(config.monitor_gpu_memory));
-    unsigned long long total_memory = 0;
-    for (const auto &device : devices) {
-      auto processes = device.get_processes();
-      for (const auto &process : processes) {
-        if (getpgid(static_cast<pid_t>(process.pid)) == pid) {
-          total_memory += process.usedGpuMemory;
-        }
-      }
-    }
-    time_t     current_time = time(nullptr);
-    struct tm *current_tm;
-    current_tm = localtime(&current_time);
-    std::array<char, 512> buffer;
-    strftime(buffer.data(), buffer.size(), "[%EY %B %d %T]", current_tm);
-    std::println(stderr, "{} {} GPU memory in use", buffer.data(), get_readable_size(total_memory).c_str());
-  }
-}
 // get devices with sufficient memory, sort in decreasing order of free memory
 static auto get_available_devices(const Options &config, std::vector<device_information> &devices)
   -> std::vector<device_information> {
@@ -358,6 +779,9 @@ static auto get_available_devices(const Options &config, std::vector<device_info
   );
   return result;
 }
+
+// these can be general purpose utility but currently only used in email handling
+#ifdef HAVE_SECRET_STORAGE
 struct subprocess {
   pid_t pid;
   FILE *standard_input;
@@ -393,10 +817,15 @@ static auto launch_subprocess(const std::vector<std::string> &arguments) -> subp
   result.standard_input = fdopen(pipes[1], "w");
   return result;
 }
+#endif
 
 auto main(int argc, char *argv[]) -> int {
-  std::println("glaunch v0.0.3 licensed under AGPLv3 or later");
+  std::println("glaunch in gps build v{}, licensed under AGPLv3 or later", GPS_VERSION);
   std::println("you can goto https://github.com/changhaoxuan23/gps for source code\n");
+  if (argc == 1) {
+    std::println(stderr, "invalid usage, invoke `glaunch --help' to see how to use glaunch.");
+    exit(EXIT_FAILURE);
+  }
 
   std::vector<std::string> args(argv, argv + argc);
   Options                  config(Parser().parse(args));
@@ -548,58 +977,49 @@ auto main(int argc, char *argv[]) -> int {
     }
   }
   setenv("CUDA_VISIBLE_DEVICES", devices_to_use.c_str(), 1);
+  std::vector<std::unique_ptr<EnvironmentArranger>> environment_arrangers;
+  if (config.monitor_gpu_memory) {
+    // configure hooked API for tracing memory usage
+    environment_arrangers.emplace_back(std::make_unique<MemoryWatcherEnvironmentArranger>(
+      config.monitor_gpu_memory, std::move(running_devices)
+    ));
+  }
   if (!config.logging_path.empty()) {
-    // setup logging first: we use tee to do this job, assuming which in
-    // installed on the system
-    //  since it is part of the GNU coreutils, it shall be safe to make such an
-    //  assumption in common cases
-    int pipes[2];
-    if (pipe(pipes) == -1) {
-      perror("failed to make pipe");
-      return -errno;
-    }
-    pid_t pid = fork();
-    if (pid == -1) {
-      perror("cannot fork");
-      return -errno;
-    }
-    if (pid == 0) {
-      dup2(pipes[0], STDIN_FILENO);
-      close(pipes[0]);
-      close(pipes[1]);
-      execlp("tee", "tee", config.logging_path.c_str(), nullptr);
-      // you shall not be here
-      perror("cannot exec tee");
-      exit(-errno);
-    }
-    // close and reopen stdout/stderr on the pipe
-    fclose(stdout);
-    fclose(stderr);
-    dup2(pipes[1], STDOUT_FILENO);
-    dup2(pipes[1], STDERR_FILENO);
-    close(pipes[0]);
-    close(pipes[1]);
-    stderr = fdopen(STDERR_FILENO, "w");
-    stdout = fdopen(STDOUT_FILENO, "w");
-    setbuf(stderr, nullptr);
-    setbuf(stdout, nullptr);
+    environment_arrangers.emplace_back(std::make_unique<LogEnvironmentArranger>(config.logging_path));
   }
-  if (config.direct_exec()) {
-    return do_launch(argv, config);
+
+  // at this point, the running_devices vector shall no longer be accessed
+  //  since the ownership has been transferred
+
+  // forking and/or executing
+  //  first, launch all before-fork hooks
+  for (const auto &arranger : environment_arrangers) {
+    arranger->before_fork();
   }
-  pid_t pid = fork();
+  //  then, fork if we need to do that
+  pid_t pid = config.direct_exec() ? 0 : fork();
   if (pid == -1) {
     perror("cannot fork");
     return -errno;
   }
+  //   launch all after-fork hooks
+  for (const auto &arranger : environment_arrangers) {
+    arranger->after_fork(pid);
+  }
   if (pid == 0) {
+    if (!config.background) {
+      // make the program executed foreground
+      //  if we are launching an interactive program, keeping it background will cause it being paused
+      //  when it tries to read from stdin
+      // we may want find a better place to make this call, likely with the main block handling background
+      //  executing, which need to be cleaned too
+      tcsetpgrp(0, getpid());
+    }
+    // execute the program
     return do_launch(argv, config);
   }
   timespec start_time;
   clock_gettime(CLOCK_MONOTONIC, &start_time);
-  if (config.monitor_gpu_memory != 0) {
-    std::thread(gpu_memory_watcher, pid, std::ref(running_devices), std::ref(config)).detach();
-  }
   int status;
   waitpid(pid, std::addressof(status), 0);
 

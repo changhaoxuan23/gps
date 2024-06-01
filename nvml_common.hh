@@ -24,6 +24,8 @@
 #include <optional>
 #include <string>
 #include <vector>
+class ReinitializeHelper;
+class NVMLSessionManager;
 
 // structure representing throughput measured by B/s
 struct throughput {
@@ -34,8 +36,11 @@ struct throughput {
 // information of a device
 //  W.I.P, fields in this struct are subject to change
 struct device_information {
+private:
+  nvmlDevice_t handle; // the handle of device
+public:
+  friend NVMLSessionManager;
   // stable information, these information is not likely to change in a relative long period
-  nvmlDevice_t               handle;     // the handle of device
   unsigned int               id;         // index of the device
   std::string                name;       // name of the device
   std::string                serial;     // board serial number of the device
@@ -61,12 +66,19 @@ struct device_information {
 class NVMLSessionManager {
 private:
   NVMLSessionManager();
-  ~NVMLSessionManager();
+  bool                            devices_initialized{false};
+  std::vector<device_information> devices;
+  void                            rebuild_underlying_structure();
 
 public:
+  ~NVMLSessionManager();
   static auto get_manager() -> NVMLSessionManager &;
-  // make a vector of device_information to all accessible devices on the system
-  auto        get_device_informations() -> std::vector<device_information>;
+  // get a vector of device_information to all accessible devices on the system
+  //  reordering the returned vector and calling methods provided on the underlying class is always allowed
+  //  removing entries from the vector will cause them no longer available for you, be careful
+  //  other operations may cause undefined behaviour
+  auto        get_device_informations() -> std::vector<device_information> &;
+  friend ReinitializeHelper;
 };
 
 // get human-readable representation of duration given in unit of seconds
