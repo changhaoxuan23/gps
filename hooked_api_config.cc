@@ -22,6 +22,7 @@
 #include <fstream>
 #include <hooked_api_config.hh>
 #include <iterator>
+#include <print>
 #include <sstream>
 #include <string>
 #include <string_view>

@@ -65,12 +65,21 @@ find_package(CUDAToolkit REQUIRED)
 # python C API, which is used to generate python traceback when applicable
 find_package(Python QUIET COMPONENTS Development)
 
-# library to interact with secret storage
-find_package(SecretStorageAccessor QUIET)
+# pkgconf to find other libraries
+find_package(PkgConfig REQUIRED)
+
+# keyutils, library to access the kernel keyring
+pkg_search_module(keyutils QUIET IMPORTED_TARGET libkeyutils)
 
 #########################
 ### configure targets ###
 #########################
+
+# utils, now only used in glaunch
+if(GPS_ENABLE_GLAUNCH)
+  add_library(gps-utils STATIC utils.cc)
+  target_include_directories(gps-utils PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+endif()
 
 # nvml_common, wrapper around NVML to provide simplified query interface
 if(GPS_ENABLE_GPS OR GPS_ENABLE_GLAUNCH)
@@ -81,68 +90,71 @@ if(GPS_ENABLE_GPS OR GPS_ENABLE_GLAUNCH)
 endif()
 
 # internal library: hooked API
-## first, use nvcc to generate preprocessed, input header
-add_custom_command(
-  OUTPUT cuda_apis.hh
-  COMMAND ${CUDAToolkit_NVCC_EXECUTABLE} -E ${CMAKE_CURRENT_SOURCE_DIR}/templates/cuda-api-starter.cc -o cuda_apis.hh
-  VERBATIM
-  CODEGEN
-)
-add_custom_target(generate_hooked_api_input_header DEPENDS cuda_apis.hh)
+# this is only used in glaunch and gtrace
+if(GPS_ENABLE_GLAUNCH OR GPS_ENABLE_GTRACE)
+  ## first, use nvcc to generate preprocessed, input header
+  add_custom_command(
+    OUTPUT cuda_apis.hh
+    COMMAND ${CUDAToolkit_NVCC_EXECUTABLE} -E ${CMAKE_CURRENT_SOURCE_DIR}/templates/cuda-api-starter.cc -o cuda_apis.hh
+    VERBATIM
+    CODEGEN
+  )
+  add_custom_target(generate_hooked_api_input_header DEPENDS cuda_apis.hh)
 
-## preprocess the hooked api header
-add_custom_command(
-  OUTPUT preprocessed_hooked_api_header.cc
-  COMMAND ${CMAKE_CXX_COMPILER} -E ${CMAKE_CURRENT_SOURCE_DIR}/hooked_api_head.cc -I ${CUDAToolkit_INCLUDE_DIRS} -I ${CMAKE_CURRENT_SOURCE_DIR} -DSCANNING -o preprocessed_hooked_api_header.cc
-  VERBATIM
-  CODEGEN
-  DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/hooked_api_head.cc
-)
-add_custom_target(preprocess_hooked_api_header DEPENDS preprocessed_hooked_api_header.cc)
+  ## preprocess the hooked api header
+  add_custom_command(
+    OUTPUT preprocessed_hooked_api_header.cc
+    COMMAND ${CMAKE_CXX_COMPILER} -E ${CMAKE_CURRENT_SOURCE_DIR}/hooked_api_head.cc -I ${CUDAToolkit_INCLUDE_DIRS} -I ${CMAKE_CURRENT_SOURCE_DIR} -DSCANNING -o preprocessed_hooked_api_header.cc
+    VERBATIM
+    CODEGEN
+    DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/hooked_api_head.cc
+  )
+  add_custom_target(preprocess_hooked_api_header DEPENDS preprocessed_hooked_api_header.cc)
 
-## configure target executable to build hooked APIs
-##  this is only required if the hooked API source is not provided
-add_executable(hooked_api_builder EXCLUDE_FROM_ALL hooked_api_builder.cc)
-### find libclang
-find_program(LLVM_CONFIG llvm-config)
-execute_process(
-  COMMAND ${LLVM_CONFIG} --cxxflags
-  OUTPUT_VARIABLE LLVM_CXXFLAGS
-  OUTPUT_STRIP_TRAILING_WHITESPACE
-)
-execute_process(
-  COMMAND ${LLVM_CONFIG} --ldflags
-  OUTPUT_VARIABLE LLVM_LDFLAGS
-  OUTPUT_STRIP_TRAILING_WHITESPACE
-)
-### link to libclang
-target_compile_options(hooked_api_builder PRIVATE ${LLVM_CXXFLAGS})
-target_link_options(hooked_api_builder PRIVATE ${LLVM_LDFLAGS})
-target_link_libraries(hooked_api_builder PRIVATE clang)
+  ## configure target executable to build hooked APIs
+  ##  this is only required if the hooked API source is not provided
+  add_executable(hooked_api_builder EXCLUDE_FROM_ALL hooked_api_builder.cc)
+  ### find libclang
+  find_program(LLVM_CONFIG llvm-config)
+  execute_process(
+    COMMAND ${LLVM_CONFIG} --cxxflags
+    OUTPUT_VARIABLE LLVM_CXXFLAGS
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+  )
+  execute_process(
+    COMMAND ${LLVM_CONFIG} --ldflags
+    OUTPUT_VARIABLE LLVM_LDFLAGS
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+  )
+  ### link to libclang
+  target_compile_options(hooked_api_builder PRIVATE ${LLVM_CXXFLAGS})
+  target_link_options(hooked_api_builder PRIVATE ${LLVM_LDFLAGS})
+  target_link_libraries(hooked_api_builder PRIVATE clang)
 
-## finally build the source file of hooked APIs
-add_custom_command(
-  OUTPUT hooked_api.cc
-  COMMAND hooked_api_builder cuda_apis.hh ${CMAKE_CURRENT_SOURCE_DIR}/hooked_api_head.cc preprocessed_hooked_api_header.cc hooked_api.cc
-  DEPENDS generate_hooked_api_input_header hooked_api_head.cc hooked_api_builder preprocess_hooked_api_header
-  VERBATIM
-  CODEGEN
-)
-add_custom_target(generate_hooked_api DEPENDS hooked_api.cc)
+  ## finally build the source file of hooked APIs
+  add_custom_command(
+    OUTPUT hooked_api.cc
+    COMMAND hooked_api_builder cuda_apis.hh ${CMAKE_CURRENT_SOURCE_DIR}/hooked_api_head.cc preprocessed_hooked_api_header.cc hooked_api.cc
+    DEPENDS generate_hooked_api_input_header hooked_api_head.cc hooked_api_builder preprocess_hooked_api_header
+    VERBATIM
+    CODEGEN
+  )
+  add_custom_target(generate_hooked_api DEPENDS hooked_api.cc)
 
-## internal library to handle configurations in hooked API
-add_library(hooked_api_config STATIC hooked_api_config.cc)
-target_include_directories(hooked_api_config PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-target_compile_definitions(hooked_api_config PRIVATE INSTALL_PREFIX="${CMAKE_INSTALL_PREFIX}")
-# this need to be relocatable to link against hooked_api
-set_target_properties(hooked_api_config PROPERTIES POSITION_INDEPENDENT_CODE ON)
+  ## internal library to handle configurations in hooked API
+  add_library(hooked_api_config STATIC hooked_api_config.cc)
+  target_include_directories(hooked_api_config PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+  target_compile_definitions(hooked_api_config PRIVATE INSTALL_PREFIX="${CMAKE_INSTALL_PREFIX}")
+  # this need to be relocatable to link against hooked_api
+  set_target_properties(hooked_api_config PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
-## the preloaded shared object of hooked APIs
-add_library(hooked_api SHARED hooked_api.cc)
-target_link_libraries(hooked_api PRIVATE hooked_api_config PUBLIC CUDA::cudart)
-if(Python_FOUND)
-  target_compile_definitions(hooked_api PRIVATE HAVE_PYTHON)
-  target_link_libraries(hooked_api PRIVATE Python::Python)
+  ## the preloaded shared object of hooked APIs
+  add_library(hooked_api SHARED hooked_api.cc)
+  target_link_libraries(hooked_api PRIVATE hooked_api_config PUBLIC CUDA::cudart)
+  if(Python_FOUND)
+    target_compile_definitions(hooked_api PRIVATE HAVE_PYTHON)
+    target_link_libraries(hooked_api PRIVATE Python::Python)
+  endif()
 endif()
 
 # gps, the process lister and inspector for GPU
@@ -156,18 +168,48 @@ endif()
 if(GPS_ENABLE_GLAUNCH)
   add_executable(glaunch glaunch.cc)
   target_compile_definitions(glaunch PRIVATE GPS_VERSION="${PROJECT_VERSION}")
-  target_link_libraries(glaunch PRIVATE ConfigurationsPP nvml_common Threads::Threads hooked_api_config)
-  if(SecretStorageAccessor_FOUND)
-    target_compile_definitions(glaunch PRIVATE HAVE_SECRET_STORAGE)
-    target_link_libraries(glaunch PRIVATE SecretStorageAccessor)
-  endif()
+  target_include_directories(glaunch PRIVATE ${CMAKE_CURRENT_LIST_DIR})
+
+  # subdirectory: glaunch modules
+  add_subdirectory(glaunch-modules)
+
+  target_link_libraries(
+    glaunch PRIVATE
+    ConfigurationsPP
+    nvml_common
+    Threads::Threads
+    hooked_api_config
+    gps-utils
+  )
 endif()
 
 
-# build gtrace: GPU call tracer
-add_executable(gtrace gtrace.cc)
-target_compile_definitions(gtrace PRIVATE GPS_VERSION="${PROJECT_VERSION}")
-target_link_libraries(gtrace PRIVATE hooked_api_config PRIVATE ConfigurationsPP)
+if(GPS_ENABLE_GTRACE)
+  # build gtrace: GPU call tracer
+  add_executable(gtrace gtrace.cc)
+  target_compile_definitions(gtrace PRIVATE GPS_VERSION="${PROJECT_VERSION}")
+  target_link_libraries(gtrace PRIVATE hooked_api_config PRIVATE ConfigurationsPP)
+endif()
+
+##################################
+### configuration installation ###
+##################################
+
+if(GPS_ENABLE_GPS)
+  install(TARGETS gps)
+endif()
+
+if(GPS_ENABLE_GLAUNCH OR GPS_ENABLE_GTRACE)
+  install(TARGETS hooked_api)
+endif()
+
+if(GPS_ENABLE_GLAUNCH)
+  install(TARGETS glaunch)
+endif()
+
+if(GPS_ENABLE_GTRACE)
+  install(TARGETS gtrace)
+endif()
 
 ##########################
 ### generate a summary ###
@@ -182,7 +224,7 @@ function(prepare_bool_for_print variable)
 endfunction()
 prepare_bool_for_print(GPS_ENABLE_GPS)
 prepare_bool_for_print(GPS_ENABLE_GLAUNCH)
-prepare_bool_for_print(SecretStorageAccessor_FOUND)
+prepare_bool_for_print(GPS_EMAIL_NOTIFIER_ENABLED)
 prepare_bool_for_print(GPS_ENABLE_GTRACE)
 prepare_bool_for_print(Python_FOUND)
 
@@ -191,7 +233,7 @@ message("  Build type                   : ${CMAKE_BUILD_TYPE}                   
 message("  Building with CUDA           : ${CUDAToolkit_VERSION}                   ")
 message("  Building gps                 : ${GPS_ENABLE_GPS}                        ")
 message("  Building glaunch             : ${GPS_ENABLE_GLAUNCH}                    ")
-message("    Secret storage enabled     : ${SecretStorageAccessor_FOUND}           ")
+message("    Email notifier enabled     : ${GPS_EMAIL_NOTIFIER_ENABLED}            ")
 message("  Building gtrace              : ${GPS_ENABLE_GTRACE}                     ")
 message("    Python stacktrace enabled  : ${Python_FOUND}                          ")
 
@@ -200,8 +242,3 @@ message("    Build with python          : ${Python_VERSION}                     
 endif()
 
 message("==========================================================================")
-
-install(
-  TARGETS gps glaunch hooked_api gtrace
-  RUNTIME DESTINATION bin
-)

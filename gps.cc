@@ -25,6 +25,7 @@
 #include <dirent.h>
 #include <fcntl.h>
 #include <map>
+#include <print>
 #include <pwd.h>
 #include <regex>
 #include <string>
