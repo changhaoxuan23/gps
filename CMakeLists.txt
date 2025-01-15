@@ -75,8 +75,8 @@ pkg_search_module(keyutils QUIET IMPORTED_TARGET libkeyutils)
 ### configure targets ###
 #########################
 
-# utils, now only used in glaunch
-if(GPS_ENABLE_GLAUNCH)
+# utils, now only used in glaunch and gps
+if(GPS_ENABLE_GPS OR GPS_ENABLE_GLAUNCH)
   add_library(gps-utils STATIC utils.cc)
   target_include_directories(gps-utils PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 endif()
@@ -161,7 +161,10 @@ endif()
 if(GPS_ENABLE_GPS)
   add_executable(gps gps.cc)
   target_compile_definitions(gps PRIVATE GPS_VERSION="${PROJECT_VERSION}")
-  target_link_libraries(gps PRIVATE nvml_common)
+  target_link_libraries(gps PRIVATE nvml_common gps-utils)
+
+  # subdirectory: gps-internals
+  add_subdirectory(gps-internal)
 endif()
 
 # glaunch, the program launching helper

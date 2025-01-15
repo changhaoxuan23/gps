@@ -1,4 +1,4 @@
-// utils.hh - General utilities that may be useful across multiple programs
+// gps-internal:filter - Filter to select processes
 // availability Copyright (C) 2025 Haoxuan Chang<changhaoxuan23@mails.ucas.ac.cn>
 
 // This is part of gps.
@@ -15,22 +15,23 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-#ifndef GPS_UTILS_HH_
-#define GPS_UTILS_HH_
-#include <filesystem>
-#include <optional>
-#include <string>
-#include <string_view>
-#include <sys/types.h>
-namespace GPS {
-// a loose approximation of the which command: this function searches under directories in PATH
-//  and tries to find the absolute (but not necessarily canonical) path of the supplied program name
-auto find_executable(std::string_view name) -> std::optional<std::filesystem::path>;
+#ifndef GPS_GPS_INTERNAL_FILTER_HH_
+#define GPS_GPS_INTERNAL_FILTER_HH_
+#include <gps-internal/process_information.hh>
 
-// get the page size of current system configuration
-auto get_pagesize() -> size_t;
+#include <memory>
+namespace GPS::Filter {
+class Filter {
+public:
+  virtual ~Filter();
 
-// convert uid to username by querying the user database
-auto to_username(uid_t uid) -> std::string;
-} // namespace GPS
+  [[nodiscard]] virtual auto evaluate(const process_information &process) const -> bool = 0;
+#ifndef NDEBUG
+  virtual void print(unsigned int indent = 0) const = 0;
+#endif
+};
+
+// build filter from commandline
+auto build_filter(int argc, char **argv) -> std::unique_ptr<Filter>;
+}; // namespace GPS::Filter
 #endif

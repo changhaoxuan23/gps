@@ -18,8 +18,10 @@
 #include <utils.hh>
 
 #include <cstdlib>
+#include <pwd.h>
 #include <ranges>
 #include <string>
+#include <unistd.h>
 
 auto GPS::find_executable(std::string_view name) -> std::optional<std::filesystem::path> {
   std::string paths{getenv("PATH")};
@@ -30,4 +32,14 @@ auto GPS::find_executable(std::string_view name) -> std::optional<std::filesyste
     }
   }
   return {};
+}
+
+auto GPS::get_pagesize() -> size_t {
+  static size_t page_size = sysconf(_SC_PAGESIZE);
+  return page_size;
+}
+
+auto GPS::to_username(uid_t uid) -> std::string {
+  const auto pwd = getpwuid(uid);
+  return pwd == nullptr ? "" : pwd->pw_name;
 }
