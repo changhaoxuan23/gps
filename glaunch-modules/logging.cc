@@ -17,6 +17,37 @@
 
 #include <logging.hh>
 
+#if __GLIBC__ < 2 || (__GLIBC__ == 2 && __GLIBC_MINOR__ < 34)
+#define USE_FALLBACK_CLOSE_RANGE
+#endif
+
+#ifdef USE_FALLBACK_CLOSE_RANGE
+#include <cerrno>
+#endif
+
+namespace {
+// since it can be common for servers to have glibc not recent enough to provide close_range(2)
+//  we try to create an stub version of which that utilizes syscall(2) directly
+//  as per manpage, close_range(2) is available since kernel 5.9 and is provided by glibc since
+//  version 2.34: we use ::syscall(436, ...) directly to make such syscall if glibc is not recent
+//  enough. If the kernel is also not recent enough, we loop to close all file descriptors
+static auto stub_close_range(unsigned int first, unsigned int last, int flags) -> long {
+#ifdef USE_FALLBACK_CLOSE_RANGE
+  auto result = ::syscall(436, first, last, flags);
+  if (result != -1 || errno != ENOSYS) {
+    return result;
+  }
+  ::close(static_cast<int>(first));
+  for (auto i = first + 1; i <= last && i > first; i++) {
+    ::close(static_cast<int>(i));
+  }
+  return 0;
+#else
+  return ::close_range(first, last, flags);
+#endif
+}
+} // namespace
+
 namespace GPS {
 void Logging::arrange_children() {
   // close and reopen stdout/stderr on the pipe
@@ -50,7 +81,7 @@ void Logging::before_fork() {
 
   if (pid == 0) {
     dup2(this->pipes[0], STDIN_FILENO);
-    close_range(3, ~0U, CLOSE_RANGE_UNSHARE);
+    stub_close_range(3, ~0U, CLOSE_RANGE_UNSHARE);
     execlp("tee", "tee", this->destination.c_str(), nullptr);
     // you shall not be here
     perror("cannot exec tee");
@@ -62,11 +93,10 @@ void Logging::before_fork() {
 }
 
 template <>
-auto prepare_module<Logging>(Configurations &parser)
-  -> std::function<std::unique_ptr<GLaunchModule>(
-    const std::unordered_map<std::string, std::any> &arguments,
-    const std::vector<std::string_view>             &raw_commandline
-  )> {
+auto prepare_module<Logging>(Configurations &parser) -> std::function<std::unique_ptr<GLaunchModule>(
+  const std::unordered_map<std::string, std::any> &arguments,
+  const std::vector<std::string_view>             &raw_commandline
+)> {
   parser.add_option("--log", Configurations::CommonParsers::identity_parser, 1);
   return [](const std::unordered_map<std::string, std::any> &arguments, const std::vector<std::string_view> &)
            -> std::unique_ptr<GLaunchModule> {

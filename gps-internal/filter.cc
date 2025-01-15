@@ -539,7 +539,11 @@ auto Kill::build(std::queue<std::string_view> &args, Environment &env) -> std::u
   static const auto signals = ([]() {
     std::array<const char *, NSIG> signals;
     for (int i = 0; i < NSIG; i++) {
+#if __GLIBC__ < 2 || (__GLIBC__ == 2 && __GLIBC_MINOR__ < 32)
+      signals[i] = sys_siglist[i];
+#else
       signals[i] = sigabbrev_np(i);
+#endif
     }
     return signals;
   })();
