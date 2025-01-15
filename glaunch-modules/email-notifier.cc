@@ -15,8 +15,10 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
+#ifdef EMAIL_NOTIFIER_SHOULD_WORK
 #define PY_SSIZE_T_CLEAN
 #include <Python.h>
+#endif
 
 #include <email-notifier.hh>
 #include <glaunch-modules/logging.hh>
@@ -206,13 +208,14 @@ auto prepare_module<EmailNotifier>(Configurations &parser)
     const std::unordered_map<std::string, std::any> &arguments,
     const std::vector<std::string_view>             &raw_commandline
   )> {
+  std::filesystem::path path;
 #ifdef EMAIL_NOTIFIER_SHOULD_WORK
   // check for send-email.py, we need that to actually send an email
   //  do not create the option if such script cannot be found
-  auto path = find_email_sender();
-  if (path.empty()) {
-    return [](const std::unordered_map<std::string, std::any> &, const std::vector<std::string_view> &)
-             -> std::unique_ptr<GLaunchModule> { return {nullptr}; };
+    path = find_email_sender();
+    if (path.empty()) {
+      return [](const std::unordered_map<std::string, std::any> &, const std::vector<std::string_view> &)
+               -> std::unique_ptr<GLaunchModule> { return {nullptr}; };
   }
   parser.add_option("--email-notify", Configurations::CommonParsers::identity_parser, 1);
 #endif

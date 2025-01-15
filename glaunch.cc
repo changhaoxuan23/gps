@@ -44,7 +44,7 @@
 #include <vector>
 
 struct Options {
-  enum class SelectionPolicy { BestFit, WorstFit };
+  enum class SelectionPolicy : uint8_t { BestFit, WorstFit };
 
   // the program to be launched shall be started in background
   //  to be specific, it shall be forked and detached from the current controlling shell with output closed
@@ -190,22 +190,22 @@ static auto do_launch(char *argv[], const Options &config) -> int {
   prctl(PR_SET_PDEATHSIG, SIGKILL);
 
   // logging the command line to be executed
-  fprintf(stderr, "executing: [");
+  std::print(stderr, "executing: [");
   for (auto i = config.break_point; argv[i] != nullptr; i++) {
     if (i != config.break_point) {
-      fprintf(stderr, ", ");
+      std::print(stderr, ", ");
     }
     fputc('\'', stderr);
     for (auto c = argv[i]; *c != '\0'; c++) {
       if (*c == '\'') {
-        fprintf(stderr, R"('"'"')");
+        std::print(stderr, R"('"'"')");
       } else {
         fputc(*c, stderr);
       }
     }
     fputc('\'', stderr);
   }
-  fprintf(stderr, "]...\n");
+  std::println(stderr, "]...");
 
   execvp(argv[config.break_point], std::addressof(argv[config.break_point]));
   perror("failed to exec");
@@ -370,7 +370,7 @@ auto main(int argc, char *argv[]) -> int {
       return -errno;
     }
     if (pid != 0) {
-      fprintf(stderr, "running in background with pid %d\n", pid);
+      std::println(stderr, "running in background with pid {}", pid);
       return 0;
     }
     // remap file descriptors
@@ -388,8 +388,8 @@ auto main(int argc, char *argv[]) -> int {
       close(dev_null_fd);
       stderr = fdopen(STDERR_FILENO, "w");
       stdout = fdopen(STDOUT_FILENO, "w");
-      setbuf(stderr, nullptr);
-      setbuf(stdout, nullptr);
+      setvbuf(stderr, nullptr, _IONBF, 0);
+      setvbuf(stdout, nullptr, _IONBF, 0);
     }
   }
   setenv("CUDA_VISIBLE_DEVICES", devices_to_use.c_str(), 1);
