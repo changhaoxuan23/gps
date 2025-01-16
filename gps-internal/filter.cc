@@ -15,6 +15,9 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
+#include <configuration.hh>
+#include <filter.hh>
+
 #include <algorithm>
 #include <array>
 #include <cerrno>
@@ -22,12 +25,13 @@
 #include <csignal>
 #include <cstdlib>
 #include <cstring>
-#include <filter.hh>
 #include <forward_list>
 #include <functional>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <print>
+#include <pwd.h>
 #include <queue>
 #include <regex>
 #include <string>
@@ -130,6 +134,7 @@ public:
 private:
   pid_t pid;
 };
+
 // match the (real) user ID
 class RealUserID : public Filter {
 public:
@@ -143,6 +148,40 @@ public:
 
 private:
   uid_t uid;
+};
+
+// match the number of GPUs used
+class GPUCount : public Filter {
+public:
+  static auto        build(std::queue<std::string_view> &args, Environment &env) -> std::unique_ptr<Filter>;
+  [[nodiscard]] auto evaluate(const process_information &process) const -> bool override;
+
+  static void help();
+#ifndef NDEBUG
+  void print(unsigned int indent = 0) const override;
+#endif
+
+private:
+  // match processes running on [minimum, maximum] GPUs
+  uint16_t minimum;
+  uint16_t maximum;
+};
+
+// match the amount of GPU memory used
+class GPUMemory : public Filter {
+public:
+  static auto        build(std::queue<std::string_view> &args, Environment &env) -> std::unique_ptr<Filter>;
+  [[nodiscard]] auto evaluate(const process_information &process) const -> bool override;
+
+  static void help();
+#ifndef NDEBUG
+  void print(unsigned int indent = 0) const override;
+#endif
+
+private:
+  // match processes utilizing [minimum, maximum] bytes of GPU memory
+  size_t minimum;
+  size_t maximum;
 };
 
 // operations
@@ -210,11 +249,56 @@ private:
 } // namespace
 
 namespace {
+// utility functions
+template <std::unsigned_integral T> static auto apply_range_modifier(std::string_view modifier, T value) {
+  struct {
+    T    minimum;
+    T    maximum;
+    bool reversed;
+  } result;
+
+  if (modifier == "=" || modifier == "==") {
+    result.reversed = false;
+    result.minimum  = value;
+    result.maximum  = value;
+  } else if (modifier == "!=") {
+    result.reversed = true;
+    result.minimum  = value;
+    result.maximum  = value;
+  } else if (modifier == "<") {
+    result.reversed = false;
+    result.minimum  = 0;
+    result.maximum  = value - 1;
+  } else if (modifier == "<=") {
+    result.reversed = false;
+    result.minimum  = 0;
+    result.maximum  = value;
+  } else if (modifier == ">") {
+    result.reversed = false;
+    result.minimum  = value + 1;
+    result.maximum  = std::numeric_limits<T>::max();
+  } else if (modifier == ">=") {
+    result.reversed = false;
+    result.minimum  = value;
+    result.maximum  = std::numeric_limits<T>::max();
+  } else {
+    std::println(stderr, "unrecognized modifier [{}]", modifier);
+    ::exit(EXIT_FAILURE);
+  }
+  return result;
+}
+} // namespace
+
+namespace {
 Not::Not(std::unique_ptr<Filter> &&filter) : filter(std::move(filter)) {}
 auto Not::evaluate(const process_information &process) const -> bool {
   return !this->filter->evaluate(process);
 }
-void Not::help() {}
+void Not::help() {
+  std::println("  -not <expression>                     Logical not. This component will evaluate to true  ");
+  std::println("                                         if and only if the expression evaluates to false. ");
+  std::println("                                                                                           ");
+}
 #ifndef NDEBUG
 void Not::print(unsigned int indent) const {
   std::println(stderr, "{}Not{{", std::string(indent * 2ul, ' '));
@@ -232,7 +316,18 @@ auto And::evaluate(const process_information &process) const -> bool {
   }
   return true;
 }
-void And::help() {}
+void And::help() {
+  std::println("  <expression> -and <expression>        Logical and. This component will evaluate to true  ");
+  std::println("                                         if and only if both of the  two expressions would ");
+  std::println("                                         evaluate to true.                                 ");
+  std::println("                                        This is the default conjunction between components.");
+  std::println("                                         <e1> -and <e2> will be evaluated in identical way ");
+  std::println("                                         as <e1> <e2>.                                     ");
+  std::println("                                        Note that this component follows the Short-circuit ");
+  std::println("                                         evaluation scheme: if the left hand side results  ");
+  std::println("                                         in false, the right hand side is not evaluated.   ");
+  std::println("                                                                                           ");
+}
 #ifndef NDEBUG
 void And::print(unsigned int indent) const {
   std::println(stderr, "{}And{{", std::string(indent * 2ul, ' '));
@@ -252,7 +347,16 @@ auto Or::evaluate(const process_information &process) const -> bool {
   }
   return false;
 }
-void Or::help() {}
+void Or::help() {
+  std::println("  <expression> -or <expression>         Logical or. This component evaluates to true if any");
+  std::println("                                         one of the two expressions evaluates to true. If  ");
+  std::println("                                         both side evaluates to false, this component will ");
+  std::println("                                         result in generating false.                       ");
+  std::println("                                        Note that this component follows the Short-circuit ");
+  std::println("                                         evaluation scheme: if the left hand side results  ");
+  std::println("                                         in true, the right hand side is not evaluated.    ");
+  std::println("                                                                                           ");
+}
 #ifndef NDEBUG
 void Or::print(unsigned int indent) const {
   std::println(stderr, "{}Or{{", std::string(indent * 2ul, ' '));
@@ -284,7 +388,13 @@ auto ProcessID::build(std::queue<std::string_view> &args, Environment &) -> std:
 auto ProcessID::evaluate(const process_information &process) const -> bool {
   return process.pid == this->pid;
 }
-void ProcessID::help() {}
+void ProcessID::help() {
+  std::println("  [-pid ]<PID>                          Match the PID of processes. This component requests");
+  std::println("                                         an exact match between the PID of process which is");
+  std::println("                                         being evaluated and the value supplied.           ");
+  std::println("                                        The component name part (`-pid') can be omitted.   ");
+  std::println("                                                                                           ");
+}
 #ifndef NDEBUG
 void ProcessID::print(unsigned int indent) const {
   std::println(stderr, "{}pid == {}", std::string(indent * 2ul, ' '), this->pid);
@@ -292,42 +402,219 @@ void ProcessID::print(unsigned int indent) const {
 #endif
 
 auto RealUserID::build(std::queue<std::string_view> &args, Environment &) -> std::unique_ptr<Filter> {
-  if (args.front() != "-user" && args.front() != "-ruid" && args.front() != "-uid") {
+  bool is_username = false;
+  if (args.front() == "-user:name" || args.front() == "-ruid:name" || args.front() == "-uid:name") {
+    is_username = true;
+  } else if (args.front() != "-user" && args.front() != "-ruid" && args.front() != "-uid") {
     return {nullptr};
   }
 
   const auto name = args.front();
   args.pop();
-  if (args.empty() || !std::ranges::all_of(args.front(), [](const char c) -> bool { return ::isdigit(c); })) {
-    std::println(stderr, "Invalid argument to {}: it does not look like a numerical UID", name);
+  if (args.empty()) {
+    std::println(stderr, "{} requires exactly one argument but none is supplied", name);
     ::exit(EXIT_FAILURE);
   }
 
+  if (!is_username) {
+    is_username = !std::ranges::all_of(args.front(), [](const char c) -> bool { return ::isdigit(c); });
+  }
+
   auto filter = std::make_unique<RealUserID>();
-  filter->uid = std::stoi(std::string{args.front()});
+  if (is_username) {
+    auto pwd = ::getpwnam(static_cast<const char *>(args.front().data()));
+    if (pwd == nullptr) {
+      std::println(stderr, "{}: cannot find user with name {}", name, args.front());
+      ::exit(EXIT_FAILURE);
+    }
+    filter->uid = pwd->pw_uid;
+  } else {
+    filter->uid = std::stoi(std::string{args.front()});
+  }
+
   args.pop();
   return filter;
 }
 auto RealUserID::evaluate(const process_information &process) const -> bool {
   return process.uids.real_uid == this->uid;
 }
-void RealUserID::help() {}
+void RealUserID::help() {
+  std::println("  -user[:name] <UID>                    Match the real user ID of processes. This requires ");
+  std::println("  -ruid[:name] <UID>                     an exact match between the real UID of the process");
+  std::println("  -uid[:name]  <UID>                     being evaluated and the value supplied.           ");
+  std::println("                                        The UID can be supplied as the user ID like 1000 or");
+  std::println("                                         the username like foobar. In case the parser fails");
+  std::println("                                         to recognize the type of UID automatically, suffix");
+  std::println("                                         the component name with `:name' so that the parser");
+  std::println("                                         will interpret the argument as username regardless");
+  std::println("                                         how it looks like.                                ");
+  std::println("                                                                                           ");
+}
 #ifndef NDEBUG
 void RealUserID::print(unsigned int indent) const {
   std::println(stderr, "{}ruid == {}", std::string(indent * 2ul, ' '), this->uid);
 }
 #endif
 
-auto Help::build(std::queue<std::string_view> &args, Environment &) -> std::unique_ptr<Filter> {
-  if (args.front() != "-help") {
+auto GPUCount::build(std::queue<std::string_view> &args, Environment &) -> std::unique_ptr<Filter> {
+  if (args.front() != "-gpus") {
     return {nullptr};
   }
-  std::println("");
+  args.pop();
+
+  if (args.empty()) {
+    std::println(stderr, "-gpus requires exactly one argument but none is supplied");
+    ::exit(EXIT_FAILURE);
+  }
+
+  auto start = args.front().find_first_of("0123456789");
+  if (start == args.front().npos) {
+    std::println(stderr, "invalid argument to -gpus");
+    ::exit(EXIT_FAILURE);
+  }
+  auto     modifier = start == 0 ? std::string_view{"="} : args.front().substr(0, start);
+  uint16_t value    = std::stoul(std::string(args.front().substr(start)));
+  auto     result   = apply_range_modifier(modifier, value);
+  auto     filter   = std::make_unique<GPUCount>();
+  filter->minimum   = result.minimum;
+  filter->maximum   = result.maximum;
+  if (result.reversed) {
+    return std::make_unique<Not>(std::move(filter));
+  }
+  return filter;
+}
+auto GPUCount::evaluate(const process_information &process) const -> bool {
+  return process.devices.size() <= this->maximum && process.devices.size() >= this->minimum;
+}
+void GPUCount::help() {
+  std::println("  -gpus [<modifier>]<number>            Match the number of GPUs being used by the process.");
+  std::println("                                        Modifiers may be used to change the way numbers are");
+  std::println("                                         interpreted. Modifiers known to this component are");
+  std::println("                                         listed in the following table.                    ");
+  std::println("                                         --------------------------------------------------");
+  std::println("                                          MODIFIER    MEANING                              ");
+  std::println("                                         --------------------------------------------------");
+  std::println("                                             =        Exact match with the number          ");
+  std::println("                                             ==       Exact match with the number          ");
+  std::println("                                             !=       Exactly not matched by the number    ");
+  std::println("                                             <        less than the number                 ");
+  std::println("                                             <=       not more than the number             ");
+  std::println("                                             >        more than the number                 ");
+  std::println("                                             >=       not less than the number             ");
+  std::println("                                         --------------------------------------------------");
+  std::println("                                        If no modifier is supplied, assume `='.            ");
+  std::println("                                                                                           ");
+}
+#ifndef NDEBUG
+void GPUCount::print(unsigned int indent) const {
+  std::println(
+    stderr, "{}{} <= GPU count <= {}", std::string(indent * 2ul, ' '), this->minimum, this->maximum
+  );
+}
+#endif
+
+auto GPUMemory::build(std::queue<std::string_view> &args, Environment &) -> std::unique_ptr<Filter> {
+  if (args.front() != "-gpu-memory") {
+    return {nullptr};
+  }
+  args.pop();
+
+  if (args.empty()) {
+    std::println(stderr, "-gpu-memory requires exactly one argument but none is supplied");
+    ::exit(EXIT_FAILURE);
+  }
+
+  auto start = args.front().find_first_of("0123456789");
+  if (start == args.front().npos) {
+    std::println(stderr, "invalid argument to -gpu-memory");
+    ::exit(EXIT_FAILURE);
+  }
+  auto                     modifier = start == 0 ? std::string_view{"="} : args.front().substr(0, start);
+  std::vector<std::string> helper;
+  helper.emplace_back(args.front().substr(start));
+  auto value =
+    std::any_cast<unsigned long long>(Configurations::CommonParsers::size_parser(helper.begin(), helper.end())
+    );
+  auto result     = apply_range_modifier(modifier, value);
+  auto filter     = std::make_unique<GPUMemory>();
+  filter->minimum = result.minimum;
+  filter->maximum = result.maximum;
+  if (result.reversed) {
+    return std::make_unique<Not>(std::move(filter));
+  }
+  return filter;
+}
+auto GPUMemory::evaluate(const process_information &process) const -> bool {
+  size_t total_memory = 0;
+  std::ranges::for_each(
+    process.devices.cbegin(),
+    process.devices.cend(),
+    [&total_memory](const process_information::host_device &device) { total_memory += device.memory_used; }
+  );
+  return total_memory <= this->maximum && total_memory >= this->minimum;
+}
+void GPUMemory::help() {
+  std::println("  -gpu-memory [<modifier>]<number>      Match the amount of GPU memory used by the process.");
+  std::println("                                         Size is measured by bytes.                        ");
+  std::println("                                        Modifiers may be used to change the way numbers are");
+  std::println("                                         interpreted. See -gpus for modifiers available.   ");
+  std::println("                                        Suffixing modifiers are available to make it easier");
+  std::println("                                         when specifying large amount. See the table below:");
+  std::println("                                         --------------------------------------------------");
+  std::println("                                          MODIFIER    MULTIPLIER                           ");
+  std::println("                                         --------------------------------------------------");
+  std::println("                                             k        2^10                                 ");
+  std::println("                                             kb       2^10                                 ");
+  std::println("                                             kib      2^10                                 ");
+  std::println("                                             m        2^20                                 ");
+  std::println("                                             mb       2^20                                 ");
+  std::println("                                             mib      2^20                                 ");
+  std::println("                                             g        2^30                                 ");
+  std::println("                                             gb       2^30                                 ");
+  std::println("                                             gib      2^30                                 ");
+  std::println("                                             t        2^40                                 ");
+  std::println("                                             tb       2^40                                 ");
+  std::println("                                             tib      2^40                                 ");
+  std::println("                                             p        2^50                                 ");
+  std::println("                                             pb       2^50                                 ");
+  std::println("                                             pib      2^50                                 ");
+  std::println("                                         --------------------------------------------------");
+  std::println("                                         These suffixing modifiers are case insensitive.   ");
+  std::println("                                                                                           ");
+}
+#ifndef NDEBUG
+void GPUMemory::print(unsigned int indent) const {
+  std::println(
+    stderr, "{}{} <= GPU memory <= {}", std::string(indent * 2ul, ' '), this->minimum, this->maximum
+  );
+}
+#endif
+
+auto Help::build(std::queue<std::string_view> &args, Environment &) -> std::unique_ptr<Filter> {
+  if (args.front() != "-help" && args.front() != "--help" && args.front() != "-h") {
+    return {nullptr};
+  }
+  std::println("gps, GPU ps, lists computational processes currently running on local system.              ");
+  std::println("                                                                                           ");
+  std::println("USAGE                                                                                      ");
+  std::println("  gps [filter-expression]                                                                  ");
+  std::println("                                                                                           ");
+  std::println(" The filter expression is evaluated against each and every computational processes found.  ");
+  std::println(" The order of processes is not specified: process with smaller PID does not necessarily be ");
+  std::println("  evaluated against before one with larger PID.                                            ");
+  std::println(" Parentheses are allowed in the expression to GROUP SUB EXPRESSIONS. Note that parentheses ");
+  std::println("  can be special characters for shells, you may need to escape them so that they will not  ");
+  std::println("  be mistaken.                                                                             ");
+  std::println("                                                                                           ");
+  std::println("EXPRESSION COMPONENTS                                                                      ");
+  std::println("                                                                                           ");
   Or::help();
   And::help();
   Not::help();
   ProcessID::help();
   RealUserID::help();
+  GPUCount::help();
+  GPUMemory::help();
   Print::help();
   Format::help();
   Execute::help();
@@ -340,7 +627,12 @@ auto Help::evaluate(const process_information &) const -> bool {
   // no-op: this function shall never be called
   return true;
 }
-void Help::help() {}
+void Help::help() {
+  std::println("  -help                                 Print this help message again. Return nothing since");
+  std::println("  --help                                 this component will terminate the program.        ");
+  std::println("  -h                                    This is an operation.                              ");
+  std::println("                                                                                           ");
+}
 #ifndef NDEBUG
 void Help::print(unsigned int indent) const {
   std::println(stderr, "{}HELP", std::string(indent * 2ul, ' '));
@@ -440,7 +732,25 @@ auto Print::evaluate(const process_information &process) const -> bool {
 
   return true;
 }
-void Print::help() {}
+void Print::help() {
+  std::println("  -print                                Print information about the process being evaluated");
+  std::println("                                         at this moment in the default format, then return ");
+  std::println("                                         true as its result.                               ");
+  std::println("                                        This is an operation.                              ");
+  std::println("                                        Print is the default operation: if no operation is ");
+  std::println("                                         configured, -print will be added automatically by ");
+  std::println("                                         changing                                          ");
+  std::println("                                           <full-expression>                               ");
+  std::println("                                          into                                             ");
+  std::println("                                           (<full-expression>) -and -print                 ");
+  std::println("                                        The output format of -print is not specified but it");
+  std::println("                                         is designed to be read by human beings. The format");
+  std::println("                                         may change without any prior notice, so don't make");
+  std::println("                                         any assumptions about the specific format. If you ");
+  std::println("                                         need to write a script, consider -format, -exec or");
+  std::println("                                         something similar.                                ");
+  std::println("                                                                                           ");
+}
 #ifndef NDEBUG
 void Print::print(unsigned int indent) const {
   std::println(stderr, "{}PRINT", std::string(indent * 2ul, ' '));
@@ -457,7 +767,15 @@ auto Format::build(std::queue<std::string_view> &args, Environment &env) -> std:
   return {nullptr};
 }
 auto Format::evaluate([[maybe_unused]] const process_information &process) const -> bool { return true; }
-void Format::help() {}
+void Format::help() {
+  std::println("  -format                               Print information about the process being evaluated");
+  std::println("                                         at the moment following the formatting instruction");
+  std::println("                                         supplied, then return true as its result.         ");
+  std::println("                                        This is an operation.                              ");
+  std::println("                                        This operation is not yet implemented, currently it");
+  std::println("                                         work in exactly the same way as -print.           ");
+  std::println("                                                                                           ");
+}
 #ifndef NDEBUG
 void Format::print(unsigned int indent) const {
   std::println(stderr, "{}FORMAT", std::string(indent * 2ul, ' '));
@@ -524,7 +842,33 @@ auto Execute::evaluate(const process_information &process) const -> bool {
   ::waitpid(pid, &status, 0);
   return WIFEXITED(status) && WEXITSTATUS(status) == 0;
 }
-void Execute::help() {}
+void Execute::help() {
+  std::println("  -exec    <command> ;                  Execute command with attributes of the process that");
+  std::println("  -execute <command> ;                   is being evaluated for now. Return the exit status");
+  std::println("                                         of command being executed, true for succeed.      ");
+  std::println("                                        This is an operation.                              ");
+  std::println("                                        Anything after component name and before the `;' is");
+  std::println("                                         is taken to construct command to be executed. Any ");
+  std::println("                                         occurrence of certain character sequence will be  ");
+  std::println("                                         replaced following specification in the following ");
+  std::println("                                         table.                                            ");
+  std::println("                                          -------------------------------------------------");
+  std::println("                                          SEQUENCE               REPLACED BY               ");
+  std::println("                                          -------------------------------------------------");
+  std::println("                                           [:pid:]               the PID of the process    ");
+  std::println("                                          -------------------------------------------------");
+  std::println("                                        Note that the command is not executed in any shell,");
+  std::println("                                         which means that shell aliases, shell builtins and");
+  std::println("                                         variable will not work. Multiple instances of exec");
+  std::println("                                         is definitely allowed, but, as can be inferred by ");
+  std::println("                                         the information aforementioned, their environment ");
+  std::println("                                         is not shared. If you want shell support, create a");
+  std::println("                                         script and run it with -exec.                     ");
+  std::println("                                         supplied, then return true as its result.         ");
+  std::println("                                        The character `;' can be special in shells, you may");
+  std::println("                                         need to escape it so that it can be passed to gps.");
+  std::println("                                                                                           ");
+}
 #ifndef NDEBUG
 void Execute::print(unsigned int indent) const {
   std::print(stderr, "{}EXECUTE(", std::string(indent * 2ul, ' '));
@@ -593,7 +937,19 @@ auto Kill::build(std::queue<std::string_view> &args, Environment &env) -> std::u
 auto Kill::evaluate(const process_information &process) const -> bool {
   return ::kill(process.pid, this->signal) == 0;
 }
-void Kill::help() {}
+void Kill::help() {
+  std::println("  -kill [<SIGNAL>]                      Kill the process currently being evaluated. Returns");
+  std::println("                                         if the kill(2) syscall is made successfully.      ");
+  std::println("                                        This is an operation.                              ");
+  std::println("                                        An optional argument may be supplied to specify the");
+  std::println("                                         signal to be sent to the proccess. Default to TERM");
+  std::println("                                         if which is not supplied.                         ");
+  std::println("                                        The signal can be specified by:                    ");
+  std::println("                                          its code,       like -kill 9                     ");
+  std::println("                                          its full name,  like -kill SIGKILL               ");
+  std::println("                                          its short name, like -kill KILL                  ");
+  std::println("                                                                                           ");
+}
 #ifndef NDEBUG
 void Kill::print(unsigned int indent) const {
   std::println(stderr, "{}KILL(sig={})", std::string(indent * 2ul, ' '), this->signal);
@@ -696,6 +1052,8 @@ static auto build_real_expression(std::queue<std::string_view> &args, Environmen
   [[maybe_unused]] static bool initialized = ([]() -> bool {
     register_filter<ProcessID>();
     register_filter<RealUserID>();
+    register_filter<GPUCount>();
+    register_filter<GPUMemory>();
     register_filter<Help>();
     register_filter<Print>();
     register_filter<Format>();
