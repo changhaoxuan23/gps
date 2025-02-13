@@ -475,9 +475,10 @@ auto GPUCount::build(std::queue<std::string_view> &args, Environment &) -> std::
   auto     modifier = start == 0 ? std::string_view{"="} : args.front().substr(0, start);
   uint16_t value    = std::stoul(std::string(args.front().substr(start)));
   auto     result   = apply_range_modifier(modifier, value);
-  auto     filter   = std::make_unique<GPUCount>();
-  filter->minimum   = result.minimum;
-  filter->maximum   = result.maximum;
+  args.pop();
+  auto filter     = std::make_unique<GPUCount>();
+  filter->minimum = result.minimum;
+  filter->maximum = result.maximum;
   if (result.reversed) {
     return std::make_unique<Not>(std::move(filter));
   }
@@ -535,7 +536,8 @@ auto GPUMemory::build(std::queue<std::string_view> &args, Environment &) -> std:
   auto value =
     std::any_cast<unsigned long long>(Configurations::CommonParsers::size_parser(helper.begin(), helper.end())
     );
-  auto result     = apply_range_modifier(modifier, value);
+  auto result = apply_range_modifier(modifier, value);
+  args.pop();
   auto filter     = std::make_unique<GPUMemory>();
   filter->minimum = result.minimum;
   filter->maximum = result.maximum;
