@@ -23,6 +23,7 @@
 
 #ifdef USE_FALLBACK_CLOSE_RANGE
 #include <cerrno>
+#define CLOSE_RANGE_UNSHARE 2
 #endif
 
 namespace {
