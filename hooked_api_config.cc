@@ -19,7 +19,6 @@
 #include <cstring>
 #include <fcntl.h>
 #include <filesystem>
-#include <fstream>
 #include <hooked_api_config.hh>
 #include <iterator>
 #include <print>
@@ -28,29 +27,22 @@
 #include <string_view>
 #include <unistd.h>
 
-// environment variable storing the address to the configuration structure
+// environment variable storing the configuration
 constexpr const char *GPS_HOOKED_API_CONFIGURATION_ENV = "GPS_HOOKED_API_CONFIGURATION";
 
-static auto get_file_path() -> std::string_view {
-  const auto raw_path = getenv(GPS_HOOKED_API_CONFIGURATION_ENV);
-  if (raw_path == nullptr) {
+static auto get_raw_configuration() -> std::string {
+  const auto raw_configuration = getenv(GPS_HOOKED_API_CONFIGURATION_ENV);
+  if (raw_configuration == nullptr) {
     return {};
   }
-  return raw_path;
+  return raw_configuration;
 }
 
 void setup_api_hook(GPSHookedAPIConfiguration &&config) {
   auto existing_configuration = get_hooked_api_configuration();
   if (existing_configuration) {
     std::ranges::move(existing_configuration->outputs, std::back_insert_iterator(config.outputs));
-  }
-  std::string path(get_file_path());
-  if (path.empty()) {
-    // make temporary file to pass the configuration
-    path = (std::filesystem::temp_directory_path() / std::format("hooked-api-config-{}.XXXXXX", getpid()))
-             .generic_string();
-    setenv(GPS_HOOKED_API_CONFIGURATION_ENV, path.c_str(), 1);
-
+  } else {
     // add hooked API to be preloaded to newly exec'ed process
     const std::filesystem::path preloader(INSTALL_PREFIX "/lib/libhooked_api.so");
     if (!std::filesystem::exists(preloader)) {
@@ -71,27 +63,26 @@ void setup_api_hook(GPSHookedAPIConfiguration &&config) {
       setenv("LD_PRELOAD", final_preload.c_str(), 1);
     }
   }
-  std::ofstream output(path);
+  std::ostringstream output;
   for (const auto &sink : config.outputs) {
-    output << sink.output_fd << ' ' << sink.include_backtrace << ' ' << sink.filter << '\n';
+    // we use ';' to end each item since which is not special character in regular expressions
+    //  and may not exist within the name of any valid API
+    output << sink.output_fd << ' ' << sink.include_backtrace << ' ' << sink.filter << ';';
   }
 }
 
 auto get_hooked_api_configuration() -> std::unique_ptr<GPSHookedAPIConfiguration> {
-  auto path = get_file_path();
-  if (path.empty()) {
-    return nullptr;
-  }
-  if (access(path.data(), R_OK) == -1) {
+  auto raw_configuration = get_raw_configuration();
+  if (raw_configuration.empty()) {
     return nullptr;
   }
 
   auto          result = std::make_unique<GPSHookedAPIConfiguration>();
-  std::ifstream input(path.data());
+  std::istringstream input(raw_configuration);
   std::string   line_buffer;
   while (true) {
     line_buffer.clear();
-    std::getline(input, line_buffer);
+    std::getline(input, line_buffer, ';');
     if (line_buffer.empty()) {
       if (input.eof()) {
         break;

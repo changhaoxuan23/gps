@@ -1,3 +1,6 @@
+v0.2.0
+[CLEANUP][hooked_api] isolate the building tool from users
+
 v0.1.0
 [FEATURE][gtrace] introducing the new program in gps: gtrace, the tracer for GPU API calls
 [ENHANCEMENT][glaunch] now glaunch can work with interactive programs, say `glaunch python`

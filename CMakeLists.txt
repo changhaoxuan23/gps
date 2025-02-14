@@ -45,9 +45,13 @@ check_ipo_supported(RESULT LTO_AVAILABLE)
 ### setup options ###
 #####################
 
+# main options
 option(GPS_ENABLE_GPS     "Build gps, ps for GPUs"                                          ON)
 option(GPS_ENABLE_GLAUNCH "Build glaunch, launching helper for programs that utilizes GPUs" ON)
 option(GPS_ENABLE_GTRACE  "Build gtrace, GPU API (CUDA API) call tracer"                    ON)
+
+# side options
+option(GPS_ENABLE_HOOKED_API_BUILDER "Build build of hooked APIs" OFF)
 
 ########################
 ### prepare packages ###
@@ -92,69 +96,7 @@ endif()
 # internal library: hooked API
 # this is only used in glaunch and gtrace
 if(GPS_ENABLE_GLAUNCH OR GPS_ENABLE_GTRACE)
-  ## first, use nvcc to generate preprocessed, input header
-  add_custom_command(
-    OUTPUT cuda_apis.hh
-    COMMAND ${CUDAToolkit_NVCC_EXECUTABLE} -E ${CMAKE_CURRENT_SOURCE_DIR}/templates/cuda-api-starter.cc -o cuda_apis.hh
-    VERBATIM
-    CODEGEN
-  )
-  add_custom_target(generate_hooked_api_input_header DEPENDS cuda_apis.hh)
-
-  ## preprocess the hooked api header
-  add_custom_command(
-    OUTPUT preprocessed_hooked_api_header.cc
-    COMMAND ${CMAKE_CXX_COMPILER} -E ${CMAKE_CURRENT_SOURCE_DIR}/hooked_api_head.cc -I ${CUDAToolkit_INCLUDE_DIRS} -I ${CMAKE_CURRENT_SOURCE_DIR} -DSCANNING -o preprocessed_hooked_api_header.cc
-    VERBATIM
-    CODEGEN
-    DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/hooked_api_head.cc
-  )
-  add_custom_target(preprocess_hooked_api_header DEPENDS preprocessed_hooked_api_header.cc)
-
-  ## configure target executable to build hooked APIs
-  ##  this is only required if the hooked API source is not provided
-  add_executable(hooked_api_builder EXCLUDE_FROM_ALL hooked_api_builder.cc)
-  ### find libclang
-  find_program(LLVM_CONFIG llvm-config)
-  execute_process(
-    COMMAND ${LLVM_CONFIG} --cxxflags
-    OUTPUT_VARIABLE LLVM_CXXFLAGS
-    OUTPUT_STRIP_TRAILING_WHITESPACE
-  )
-  execute_process(
-    COMMAND ${LLVM_CONFIG} --ldflags
-    OUTPUT_VARIABLE LLVM_LDFLAGS
-    OUTPUT_STRIP_TRAILING_WHITESPACE
-  )
-  ### link to libclang
-  target_compile_options(hooked_api_builder PRIVATE ${LLVM_CXXFLAGS})
-  target_link_options(hooked_api_builder PRIVATE ${LLVM_LDFLAGS})
-  target_link_libraries(hooked_api_builder PRIVATE clang)
-
-  ## finally build the source file of hooked APIs
-  add_custom_command(
-    OUTPUT hooked_api.cc
-    COMMAND hooked_api_builder cuda_apis.hh ${CMAKE_CURRENT_SOURCE_DIR}/hooked_api_head.cc preprocessed_hooked_api_header.cc hooked_api.cc
-    DEPENDS generate_hooked_api_input_header hooked_api_head.cc hooked_api_builder preprocess_hooked_api_header
-    VERBATIM
-    CODEGEN
-  )
-  add_custom_target(generate_hooked_api DEPENDS hooked_api.cc)
-
-  ## internal library to handle configurations in hooked API
-  add_library(hooked_api_config STATIC hooked_api_config.cc)
-  target_include_directories(hooked_api_config PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-  target_compile_definitions(hooked_api_config PRIVATE INSTALL_PREFIX="${CMAKE_INSTALL_PREFIX}")
-  # this need to be relocatable to link against hooked_api
-  set_target_properties(hooked_api_config PROPERTIES POSITION_INDEPENDENT_CODE ON)
-
-  ## the preloaded shared object of hooked APIs
-  add_library(hooked_api SHARED hooked_api.cc)
-  target_link_libraries(hooked_api PRIVATE hooked_api_config PUBLIC CUDA::cudart)
-  if(Python_FOUND)
-    target_compile_definitions(hooked_api PRIVATE HAVE_PYTHON)
-    target_link_libraries(hooked_api PRIVATE Python::Python)
-  endif()
+  add_subdirectory(tools/hooked_api_builder)
 endif()
 
 # gps, the process lister and inspector for GPU
@@ -245,3 +187,22 @@ message("    Build with python          : ${Python_VERSION}                     
 endif()
 
 message("==========================================================================")
+
+set(CPACK_SOURCE_GENERATOR "TZST")
+set(CPACK_VERBATIM_VARIABLES YES)
+# get an escaped version of current source directory
+string(REGEX REPLACE
+  [[\[|\]|\(|\)|\.|\+|\*|\^|\\|\$|\?|\|]] [[\\\0]]
+  ESCAPED_CURRENT_SOURCE_DIRECTORY
+  ${CMAKE_SOURCE_DIR}
+)
+set(CPACK_SOURCE_IGNORE_FILES
+  ${ESCAPED_CURRENT_SOURCE_DIRECTORY}/build
+  ${ESCAPED_CURRENT_SOURCE_DIRECTORY}/install
+  ${ESCAPED_CURRENT_SOURCE_DIRECTORY}/\\.git
+  ${ESCAPED_CURRENT_SOURCE_DIRECTORY}/\\.vscode
+  ${ESCAPED_CURRENT_SOURCE_DIRECTORY}/\\.cache
+  ${ESCAPED_CURRENT_SOURCE_DIRECTORY}/\\.clang-format
+  ${ESCAPED_CURRENT_SOURCE_DIRECTORY}/\\.gitignore
+)
+include(CPack)
