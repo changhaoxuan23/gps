@@ -17,6 +17,8 @@
 
 #include <logging.hh>
 
+#include <print>
+
 #if __GLIBC__ < 2 || (__GLIBC__ == 2 && __GLIBC_MINOR__ < 34)
 #define USE_FALLBACK_CLOSE_RANGE
 #endif
