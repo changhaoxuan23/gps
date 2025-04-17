@@ -257,27 +257,27 @@ template <std::unsigned_integral T> static auto apply_range_modifier(std::string
     bool reversed;
   } result;
 
-  if (modifier == "=" || modifier == "==") {
+  if (modifier == "eq") {
     result.reversed = false;
     result.minimum  = value;
     result.maximum  = value;
-  } else if (modifier == "!=") {
+  } else if (modifier == "ne") {
     result.reversed = true;
     result.minimum  = value;
     result.maximum  = value;
-  } else if (modifier == "<") {
+  } else if (modifier == "lt") {
     result.reversed = false;
     result.minimum  = 0;
     result.maximum  = value - 1;
-  } else if (modifier == "<=") {
+  } else if (modifier == "le") {
     result.reversed = false;
     result.minimum  = 0;
     result.maximum  = value;
-  } else if (modifier == ">") {
+  } else if (modifier == "gt") {
     result.reversed = false;
     result.minimum  = value + 1;
     result.maximum  = std::numeric_limits<T>::max();
-  } else if (modifier == ">=") {
+  } else if (modifier == "ge") {
     result.reversed = false;
     result.minimum  = value;
     result.maximum  = std::numeric_limits<T>::max();
@@ -495,15 +495,14 @@ void GPUCount::help() {
   std::println("                                         --------------------------------------------------");
   std::println("                                          MODIFIER    MEANING                              ");
   std::println("                                         --------------------------------------------------");
-  std::println("                                             =        Exact match with the number          ");
-  std::println("                                             ==       Exact match with the number          ");
-  std::println("                                             !=       Exactly not matched by the number    ");
-  std::println("                                             <        less than the number                 ");
-  std::println("                                             <=       not more than the number             ");
-  std::println("                                             >        more than the number                 ");
-  std::println("                                             >=       not less than the number             ");
+  std::println("                                             eq       Exact match with the number          ");
+  std::println("                                             ne       Exactly not matched by the number    ");
+  std::println("                                             lt       less than the number                 ");
+  std::println("                                             le       not more than the number             ");
+  std::println("                                             gt       more than the number                 ");
+  std::println("                                             ge       not less than the number             ");
   std::println("                                         --------------------------------------------------");
-  std::println("                                        If no modifier is supplied, assume `='.            ");
+  std::println("                                        If no modifier is supplied, assume `eq'.           ");
   std::println("                                                                                           ");
 }
 #ifndef NDEBUG
@@ -530,7 +529,7 @@ auto GPUMemory::build(std::queue<std::string_view> &args, Environment &) -> std:
     std::println(stderr, "invalid argument to -gpu-memory");
     ::exit(EXIT_FAILURE);
   }
-  auto                     modifier = start == 0 ? std::string_view{"="} : args.front().substr(0, start);
+  auto                     modifier = start == 0 ? std::string_view{"eq"} : args.front().substr(0, start);
   std::vector<std::string> helper;
   helper.emplace_back(args.front().substr(start));
   auto value =
