@@ -25,7 +25,7 @@
 
 auto GPS::find_executable(std::string_view name) -> std::optional<std::filesystem::path> {
   std::string paths{getenv("PATH")};
-  for (const auto path : std::views::split(paths, ":")) {
+  for (const auto path : std::views::split(paths, ':')) {
     auto target{std::filesystem::path(std::string_view(path)) / name};
     if (std::filesystem::is_regular_file(target)) {
       return {target};
