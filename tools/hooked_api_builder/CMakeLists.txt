@@ -26,22 +26,9 @@ if(GPS_ENABLE_HOOKED_API_BUILDER)
 
   ## configure target executable to build hooked APIs
   add_executable(hooked_api_builder EXCLUDE_FROM_ALL hooked_api_builder.cc)
-  ### find libclang
-  find_program(LLVM_CONFIG llvm-config REQUIRED)
-  execute_process(
-    COMMAND ${LLVM_CONFIG} --cxxflags
-    OUTPUT_VARIABLE LLVM_CXXFLAGS
-    OUTPUT_STRIP_TRAILING_WHITESPACE
-  )
-  execute_process(
-    COMMAND ${LLVM_CONFIG} --ldflags
-    OUTPUT_VARIABLE LLVM_LDFLAGS
-    OUTPUT_STRIP_TRAILING_WHITESPACE
-  )
-  ### link to libclang
-  target_compile_options(hooked_api_builder PRIVATE ${LLVM_CXXFLAGS})
-  target_link_options(hooked_api_builder PRIVATE ${LLVM_LDFLAGS})
-  target_link_libraries(hooked_api_builder PRIVATE clang)
+  ### find and link to libclang
+  find_package(Clang REQUIRED)
+  target_link_libraries(hooked_api_builder PRIVATE libclang)
 
   ## finally build the source file of hooked APIs
   add_custom_command(

@@ -4,7 +4,7 @@ project(
   VERSION 0.1.0
   DESCRIPTION "GPU utils"
   HOMEPAGE_URL "https://github.com/changhaoxuan23/gps"
-  LANGUAGES CXX
+  LANGUAGES C CXX
 )
 
 # export compile_commands.json to help with development
