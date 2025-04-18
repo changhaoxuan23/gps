@@ -57,7 +57,12 @@ struct process_information {
   pid_t                    pid;
   std::vector<host_device> devices;
   unsigned long long       cpu_memory;
+
+  // collected commandline of the process
   std::vector<std::string> args;
+  // number of null bytes in the commandline, after the terminator of the last non-empty string
+  size_t                   cmdline_tailing_null_bytes;
+
   uids                     uids;
   timing                   timing;
 

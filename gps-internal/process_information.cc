@@ -117,11 +117,25 @@ process_information::process_information(pid_t pid) : pid(pid) {
 
   { // get command line
     auto fd = openat(process_fd, "cmdline", O_RDONLY);
+    this->cmdline_tailing_null_bytes = 0;
     if (fd == -1) {
       std::println(stderr, "cannot get commandline of pid {}: {}", pid, error_string());
     } else {
       FILE *file = fdopen(fd, "r");
+
+      // To be precise, this counts the number of tokens we have seen excluding empty strings after the last
+      //  non-empty one. Take these as examples:
+      // "foo" "bar"             --> collected_tokens == 2
+      // "foo" "bar" "" ""       --> collected_tokens == 2
+      // "foo" "bar" "" "foobar" --> collected_tokens == 4
+      size_t collected_tokens = 0;
+
       while (true) {
+        // Tokens in commandline are separated by null bytes. However, some processes will erase (zero out)
+        //  their commandline, which leaves an instance of "" for each byte cleared since each of which is
+        //  recognized as an empty string.
+        // Therefore, we count the null bytes after the last token that is not an empty string and omit the
+        //  generation of "" in collected commandline
         size_t buffer_size = 0;
         char  *buffer      = nullptr;
         auto   string_size = ::getdelim(&buffer, &buffer_size, '\0', file);
@@ -129,10 +143,18 @@ process_information::process_information(pid_t pid) : pid(pid) {
           free(buffer);
           break;
         }
-        std::string token(buffer, string_size - 1);
+        // return value of getdelim is number of bytes read including the delimiter
+        //  substract one from it to get the real string size
+        string_size -= 1;
+        std::string token(buffer, string_size);
         free(buffer);
         this->args.emplace_back(std::move(token));
+        if (string_size != 0) {
+          collected_tokens = this->args.size();
+        }
       }
+      this->cmdline_tailing_null_bytes = this->args.size() - collected_tokens;
+      this->args.resize(collected_tokens);
       fclose(file);
     }
   }

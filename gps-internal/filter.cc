@@ -657,6 +657,9 @@ auto Print::evaluate(const process_information &process) const -> bool {
     for (const auto &part : process.args) {
       std::cout << std::quoted(part) << ' ';
     }
+    if (process.cmdline_tailing_null_bytes != 0) {
+      std::print("[{} tailing null bytes, cmdline may have been erased]", process.cmdline_tailing_null_bytes);
+    }
     putchar('\n');
   }
 
