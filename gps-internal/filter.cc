@@ -472,7 +472,7 @@ auto GPUCount::build(std::queue<std::string_view> &args, Environment &) -> std::
     std::println(stderr, "invalid argument to -gpus");
     ::exit(EXIT_FAILURE);
   }
-  auto     modifier = start == 0 ? std::string_view{"="} : args.front().substr(0, start);
+  auto     modifier = start == 0 ? std::string_view{"eq"} : args.front().substr(0, start);
   uint16_t value    = std::stoul(std::string(args.front().substr(start)));
   auto     result   = apply_range_modifier(modifier, value);
   args.pop();
@@ -684,21 +684,18 @@ auto Print::evaluate(const process_information &process) const -> bool {
   // timing information
   std::println("[{}]   Timing:", process.pid);
   std::println(
-    stderr,
     "[{}]     Usermode:    {} second(s) ({})",
     process.pid,
     process.timing.usermode_seconds,
     get_readable_duration(process.timing.usermode_seconds)
   );
   std::println(
-    stderr,
     "[{}]     Kernelmode:  {} second(s) ({})",
     process.pid,
     process.timing.kernelmode_seconds,
     get_readable_duration(process.timing.kernelmode_seconds)
   );
   std::println(
-    stderr,
     "[{}]     Wall-clock:  {} second(s) ({})",
     process.pid,
     process.timing.elapsed_seconds,
@@ -706,7 +703,7 @@ auto Print::evaluate(const process_information &process) const -> bool {
   );
 
   // CPU information
-  std::println(stderr, "[{}]   CPU memory: {}", process.pid, get_readable_size(process.cpu_memory));
+  std::println("[{}]   CPU memory: {}", process.pid, get_readable_size(process.cpu_memory));
 
   // GPU information
   unsigned long long total_gpu_memory = 0;
@@ -714,7 +711,6 @@ auto Print::evaluate(const process_information &process) const -> bool {
     total_gpu_memory += device.memory_used;
   }
   std::println(
-    stderr,
     "[{}]   GPU memory: running on {} devices, {} in use",
     process.pid,
     process.devices.size(),
@@ -722,7 +718,6 @@ auto Print::evaluate(const process_information &process) const -> bool {
   );
   for (const auto &device : process.devices) {
     std::println(
-      stderr,
       "[{}]     on device {} ({}): {} / {}, {:.3}%",
       process.pid,
       device.device.id,
