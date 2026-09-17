@@ -1,5 +1,5 @@
 // glaunch-modules-timing - Time the launched program for glaunch
-// availability Copyright (C) 2025 Haoxuan Chang<changhaoxuan23@mails.ucas.ac.cn>
+// Copyright (C) 2025 Haoxuan Chang<changhaoxuan23@mails.ucas.ac.cn>
 
 // This is part of gps.
 // This program is free software: you can redistribute it and/or modify
@@ -21,8 +21,14 @@
 
 #include <ctime>
 namespace GPS {
-class Timing : public GLaunchModule {
-public:
+struct Timing {
+  static void install_parser(Configurations &parser);
+  static void show_help();
+  static void register_module(
+    GLaunchModuleManagerBuilder                     &manager_builder,
+    const std::unordered_map<std::string, std::any> &parsed_commandline,
+    const std::vector<std::string_view>             &raw_commandline
+  );
   auto get_module_attribute() -> ModuleAttribute override;
   auto name() -> std::string_view override;
 
@@ -37,6 +43,7 @@ private:
   timespec start_time;
   timespec end_time;
 };
+static_assert(GLaunchModule<Timing>);
 
 template <>
 auto prepare_module<Timing>(Configurations &parser)

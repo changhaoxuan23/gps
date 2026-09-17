@@ -1,5 +1,5 @@
 // glaunch-modules-logging - Handle logging (output redirection) for glaunch
-// availability Copyright (C) 2025 Haoxuan Chang<changhaoxuan23@mails.ucas.ac.cn>
+// Copyright (C) 2025 Haoxuan Chang<changhaoxuan23@mails.ucas.ac.cn>
 
 // This is part of gps.
 // This program is free software: you can redistribute it and/or modify
@@ -15,6 +15,7 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
+#include "glaunch-module-manager.hh"
 #include <logging.hh>
 
 #include <print>
@@ -109,6 +110,9 @@ auto prepare_module<Logging>(Configurations &parser) -> std::function<std::uniqu
     const auto logging_path = std::any_cast<std::string>(arguments.at("log"));
     return std::make_unique<Logging>(logging_path);
   };
+  GlaunchModuleManager a;
+  static Logging       logging("234");
+  a.register_module("1234", ModuleAttribute::Empty, nullptr);
 }
 
 template <> void show_help<Logging>() {

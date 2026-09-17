@@ -1,0 +1,104 @@
+This directory contains implementations of extra (additional) functionalities of glaunch.
+
+Rationale
+=========
+
+The core functionality of glaunch is fairly simple and straightforward: investigating the system in search of
+ GPU devices with sufficient video memory or waiting for GPUs to be released if the requirement cannot be met
+ at this moment; setting up the environment variable CUDA_VISIBLE_DEVICES to instruct program being launched;
+ and finally launching the program. Back to the time when this program was first written, this was the entire
+ picture of it: all it was supposed to do is to help the users to find suitable devices for their program and
+ set CUDA_VISIBLE_DEVICES accordingly.
+
+However, more and more functionalities are introduced to glaunch since we keep finding something good to have
+ in it. They were first simply stacked into a single source file, whose readability, therefore, dropped along
+ with each one implemented. There was then a time point when we decided the source being unacceptably hard to
+ understand, then the extra functionalities were modularized into standalone modules, one in a source file.
+
+But modules are never truly standalone. For example, the email-notifier module will send email to the address
+ configured when the program was launched, notifying about the completion of running, which would include the
+ log captured by the logging module if there do exist an active one, and the timing information if there is a
+ timing module currently active. This dependency requires that the email-notifier module must run after those
+ modules have finished their run and had information collected. For now, this must be done by registering the
+ email-notifier module after other modules manually. Furthermore, checking if certain module is active has to
+ be done by iterating over all modules registered and checking their names, which retrieving information from
+ other modules can only be done by acquiring a pointer to the module then accessing public members within it.
+
+The module manager is thereby introduced to solve these questions. As a manager, it works much like the D-BUS
+ daemon or the core ROS server: modules register themselves to the manager with their names and running order
+ requirements, which the manager calculates executing order of modules that satisfies all requirements, keeps
+ lists of active modules and protocols they implements. With the help of module manager, executing orders can
+ be explicitly specified with primitive run before / after, and exchanging information with other modules can
+ be achieved by sending requests to the module manager according to the protocol, which in turn get forwarded
+ by the manager to all active modules implemented such protocol, with the results being forwarded back to the
+ module initiates the request.
+
+
+Protocol Specification
+======================
+
+A protocol is just like a programming interface, or what you call a method in D-BUS. A name together with its
+ calling arguments (input parameters) and returning type (output parameters) is declared in a protocol. There
+ are two types of protocol, namely standard protocols and extra protocols. Standard protocols are declared in
+ glaunch-protocols.hh with an unique integral id assigned to each of them. Their arguments and returning type
+ are also declared in the same file, enabling compile-time restriction via the typing system. Extra protocols
+ are protocols declared individually about which the manager knows nothing in advance: when requests to these
+ protocols are sent to the manager, all it does is to pack arguments passed into a std::tuple, 
+
+Name of protocol
+
+
+Module Specification
+====================
+
+A module is technically a class derived from GLaunchModule(see glaunch-module.hh) with several static methods
+ implemented, or an instance of such classes. The full requirements of module type is specified as a concept,
+ GLaunchModuleInterface, which is declared in glaunch-module-manager.hh.
+
+A module can be referenced by (in cases of checking ones existence, )
+
+
+
+
+Hooks Defined
+=============
+
+Hooks are declared in glaunch-hooks.hh
+
+Checklist for adding new hooks
+------------------------------
+
+1. Add the hook id in glaunch-hooks.hh
+2. (on demand) Add types used in the hook interface in glaunch-hooks.hh
+3. Declare the hook interface by adding new specialization to Hook in glaunch-hooks.hh
+4. Update comment at the beginning of implementation of GLaunchModuleManagerBuilder::finalize
+5. Add collection of the new hook in implementation of GLaunchModuleManagerBuilder::finalize
+6. Update the figure in implementation of GLaunchModuleManagerBuilder::finalize
+7. Create range for it in GLaunchModuleManagerBuilder::finalize (3.5)
+8. Place the create range into the array in GLaunchModuleManagerBuilder::finalize (3.6)
+9. (on demand) Add partial specialization to GlaunchModuleManager::execute_hook
+
+before_fork: std::function<void()>
+----------------------------------
+This hook runs right before fork(2) is called to create the process, in which the program to be launched will
+ be executed later. However, note that this hook will be invoked even if fork(2) will NOT be called under the
+ configurations specified.
+fork(2) will not get called if and only if none of the active modules have the KeepAlive attribute set, which
+ means glaunch would have nothing to do after the program get launched, rendering creation of extra processes
+ meaningless and therefore can and will be omitted.
+
+after_parent_fork: std::function<void(pid_t)>
+---------------------------------------------
+This hook runs right after returning from fork(2) into the parent process. The PID of child process is passed
+ as its only argument. As specified for hook before_fork (see above), fork(2) may not be called under certain
+ circumstances, in which case this hook will not be invoked since there will be no "parent process".
+
+before_exec: std::function<void()>
+----------------------------------
+This hook runs right before exec(2) is called to actually launce the program.
+
+after_exit: std::function<void(ExitStatus)>
+-------------------------------------------
+This hook runs right after the launched program (or process, to be specific) has exited. The collected status
+ is passes as its only argument. It is obvious that this hook would have no change to run if the main process
+ of glaunch has terminated, therefore any module that implements this hook must have KeepAlive attribute set.

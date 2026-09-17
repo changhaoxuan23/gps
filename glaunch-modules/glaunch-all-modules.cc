@@ -1,4 +1,4 @@
-// gps-internal:filter - Filter to select processes
+// glaunch-all-modules - unified, single interface to initialize all modules
 // Copyright (C) 2025 Haoxuan Chang<changhaoxuan23@mails.ucas.ac.cn>
 
 // This is part of gps.
@@ -15,23 +15,5 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-#ifndef GPS_GPS_INTERNAL_FILTER_HH_
-#define GPS_GPS_INTERNAL_FILTER_HH_
-#include <gps-internal/process_information.hh>
-
-#include <memory>
-namespace GPS::Filter {
-class Filter {
-public:
-  virtual ~Filter();
-
-  [[nodiscard]] virtual auto evaluate(const process_information &process) const -> bool = 0;
-#ifndef NDEBUG
-  virtual void print(unsigned int indent = 0) const = 0;
-#endif
-};
-
-// build filter from commandline
-auto build_filter(int argc, char **argv) -> std::unique_ptr<Filter>;
-}; // namespace GPS::Filter
-#endif
+#include <glaunch-all-modules.hh>
+namespace GPS {} // namespace GPS
